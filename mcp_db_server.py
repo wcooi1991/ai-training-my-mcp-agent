@@ -746,7 +746,7 @@ def summarize_solar_period(
     """
     Compact solar/inverter summary for a data_period (e.g. 2026-10, 2026-11).
     Returns period totals, daily kWh rollup, generation by daypart, RM savings, and
-    grouped_bar_chart + line_production_trend averaged by day-of-week (Mon–Sun).
+    grouped_bar_chart averaged by day-of-week (Mon–Sun); line_production_trend by calendar day.
     Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive (max ~3 months when both set).
     """
     ensure_database()
@@ -870,19 +870,17 @@ def summarize_solar_period(
                 "rows": weekday_rows,
             },
             "line_production_trend": {
-                "title": f"Avg production by weekday (kWh) — {period}",
+                "title": f"Daily production (kWh) — {period}",
                 "x_field": "day",
-                "x_title": "Day of week",
-                "x_sort": list(WEEKDAY_ORDER),
-                "aggregation": "weekday_average",
+                "x_title": "Calendar day",
+                "aggregation": "calendar_day",
                 "y_field": "production_kwh",
                 "rows": [
                     {
-                        "day": r["day"],
-                        "production_kwh": r["production_kwh"],
-                        "sample_days": r.get("sample_days", 0),
+                        "day": d["day"],
+                        "production_kwh": float(d["production_kwh"]),
                     }
-                    for r in weekday_rows
+                    for d in daily
                 ],
             },
         }
@@ -1078,6 +1076,8 @@ def compare_solar_periods(
             "dual_line_chart": {
                 "title": f"Daily energy flows — {period_a} vs {period_b}",
                 "x_field": "day",
+                "x_title": "Calendar day",
+                "aggregation": "calendar_day",
                 "y_field": "kwh",
                 "series_field": "data_period",
                 "stroke_field": "flow",

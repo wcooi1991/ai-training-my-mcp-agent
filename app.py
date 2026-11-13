@@ -404,7 +404,8 @@ def render_solar_summary_charts(payload: dict) -> None:
         x_sort = line_spec.get("x_sort")
         x_title = line_spec.get("x_title", "Day")
         y_title = "Avg production (kWh)" if weekday_avg else "Production (kWh)"
-        if weekday_avg or x_sort:
+        use_weekday_axis = weekday_avg or (x_sort and line_spec.get("aggregation") != "calendar_day")
+        if use_weekday_axis:
             line = (
                 alt.Chart(line_df)
                 .mark_line(point=True)
@@ -613,7 +614,7 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "(stacked_bar_chart = **weekday average** Mon–Sun; daily detail in JSON). "
                 "Bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
                 "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: **weekday-averaged** "
-                "grouped flows + production line; calendar detail in `daily_rollup`). For **Oct vs Nov**, "
+                "grouped bar + **per-calendar-day** production line; detail in `daily_rollup`). For **Oct vs Nov**, "
                 "use `compare_solar_periods(a, b)` (multi-flow line chart, grouped averages, "
                 "`roi_comparison`) — not two separate summarizes. When explaining ROI impact, cite "
                 "`roi_comparison.impact_summary` concisely (monthly savings & payback deltas). Financial figures must match "
