@@ -1,8 +1,12 @@
 
+import csv
 import json
 import os
 import sqlite3
 import sys
+from datetime import datetime
+from glob import glob
+
 import sqlparse
 
 try:
@@ -10,116 +14,333 @@ try:
 except ImportError:
     from mcp.server.fastmcp import FastMCP as MCPServer
 
-mcp = MCPServer("BankingSQLiteMCPServer")
+mcp = MCPServer("SolarROISQLiteMCPServer")
 
-DB_FILE = sys.argv[1] if len(sys.argv) > 1 else "bank11.sqlite"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = sys.argv[1] if len(sys.argv) > 1 else os.path.join(BASE_DIR, "solar_roi.sqlite")
+TNB_DIR = os.path.join(BASE_DIR, "tnb-data")
+SOLAR_OCT_DIR = os.path.join(BASE_DIR, "solar-data")
+SOLAR_NOV_DIR = os.path.join(BASE_DIR, "new-solar-data")
 
-def ensure_database():
-    """Auto-bootstrap sample banking database if not already present."""
-    if not os.path.exists(DB_FILE):
+SOLAR_PERIOD_VIEW_SQL = """
+CREATE VIEW IF NOT EXISTS v_tnb_usage_with_period AS
+SELECT
+    id,
+    reading_datetime,
+    usage_kwh,
+    source_file_date,
+    CASE
+        WHEN CAST(strftime('%H', reading_datetime) AS INTEGER) >= 7
+             AND CAST(strftime('%H', reading_datetime) AS INTEGER) < 10 THEN 'partial_solar_am'
+        WHEN CAST(strftime('%H', reading_datetime) AS INTEGER) >= 10
+             AND CAST(strftime('%H', reading_datetime) AS INTEGER) < 16 THEN 'peak_solar'
+        WHEN CAST(strftime('%H', reading_datetime) AS INTEGER) >= 16
+             AND CAST(strftime('%H', reading_datetime) AS INTEGER) < 19 THEN 'partial_solar_pm'
+        ELSE 'no_solar'
+    END AS solar_period
+FROM tnb_usage;
+
+CREATE VIEW IF NOT EXISTS v_solar_interval_kwh AS
+SELECT
+    id,
+    plant_name,
+    reading_time,
+    data_period,
+    production_w / 12000.0 AS production_kwh,
+    consumption_w / 12000.0 AS consumption_kwh,
+    CASE WHEN grid_flow_w > 0 THEN grid_flow_w / 12000.0 ELSE 0 END AS import_kwh,
+    CASE WHEN grid_flow_w < 0 THEN (-grid_flow_w) / 12000.0 ELSE 0 END AS export_kwh
+FROM solar_readings;
+
+CREATE VIEW IF NOT EXISTS v_solar_daily_totals AS
+SELECT
+    data_period,
+    date(reading_time) AS day,
+    ROUND(SUM(production_w) / 12000.0, 3) AS production_kwh,
+    ROUND(SUM(CASE WHEN grid_flow_w > 0 THEN grid_flow_w ELSE 0 END) / 12000.0, 3) AS import_kwh,
+    ROUND(SUM(CASE WHEN grid_flow_w < 0 THEN -grid_flow_w ELSE 0 END) / 12000.0, 3) AS export_kwh,
+    ROUND(
+        SUM(production_w) / 12000.0
+        - SUM(CASE WHEN grid_flow_w < 0 THEN -grid_flow_w ELSE 0 END) / 12000.0,
+        3
+    ) AS self_consumed_kwh
+FROM solar_readings
+GROUP BY data_period, date(reading_time);
+"""
+
+
+def _parse_tnb_datetime(raw: str) -> str:
+    """DD-MM-YYYY HH:MM -> ISO local timestamp for SQLite."""
+    dt = datetime.strptime(raw.strip(), "%d-%m-%Y %H:%M")
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tnb_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reading_datetime TEXT NOT NULL,
+            usage_kwh REAL NOT NULL,
+            source_file_date TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tnb_dt ON tnb_usage(reading_datetime);
+
+        CREATE TABLE IF NOT EXISTS solar_readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plant_name TEXT NOT NULL,
+            reading_time TEXT NOT NULL,
+            production_w REAL NOT NULL,
+            consumption_w REAL NOT NULL,
+            grid_flow_w REAL NOT NULL,
+            battery_w REAL NOT NULL,
+            data_period TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_solar_dt ON solar_readings(reading_time);
+        CREATE INDEX IF NOT EXISTS idx_solar_period ON solar_readings(data_period);
+
+        CREATE TABLE IF NOT EXISTS roi_assumptions (
+            assumption_key TEXT PRIMARY KEY,
+            assumption_value REAL,
+            text_value TEXT,
+            unit TEXT,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS import_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    conn.executescript(SOLAR_PERIOD_VIEW_SQL)
+
+
+def _seed_roi_assumptions(conn: sqlite3.Connection) -> None:
+    rows = [
+        ("export_credit_atap_rm_per_kwh", 0.2703, None, "RM/kWh", "PathGreen quote; confirm on first ATAP bill"),
+        ("import_avoided_rm_per_kwh", 0.4443, None, "RM/kWh", "Gen + capacity + network components (assumed)"),
+        ("export_credit_low_rm_per_kwh", 0.218, None, "RM/kWh", "Sensitivity: alternate export credit"),
+        ("import_avoided_low_rm_per_kwh", 0.40, None, "RM/kWh", "Sensitivity"),
+        ("import_avoided_high_rm_per_kwh", 0.50, None, "RM/kWh", "Sensitivity"),
+        ("gross_investment_rm", 17500.0, None, "RM", "Package + EV cable"),
+        ("suria_rebate_rm", 3000.0, None, "RM", "RM 600/kWac cap"),
+        ("net_investment_rm", 14500.0, None, "RM", "After SuRIA rebate"),
+        ("october_monthly_savings_rm", 257.0, None, "RM", "Baseline from logged October"),
+        ("headline_payback_years", 4.7, None, "years", "Net investment / monthly savings"),
+    ]
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO roi_assumptions
+        (assumption_key, assumption_value, text_value, unit, notes)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def import_tnb_csvs(conn: sqlite3.Connection) -> int:
+    paths = sorted(glob(os.path.join(TNB_DIR, "*.csv")))
+    inserted = 0
+    for path in paths:
+        file_date = os.path.splitext(os.path.basename(path))[0]
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                date_key = next((k for k in row if "date" in k.lower()), None)
+                usage_key = next((k for k in row if "usage" in k.lower()), None)
+                if not date_key or not usage_key or not row.get(date_key):
+                    continue
+                try:
+                    usage = float(row[usage_key].strip())
+                except (TypeError, ValueError):
+                    continue
+                dt_iso = _parse_tnb_datetime(row[date_key])
+                conn.execute(
+                    """
+                    INSERT INTO tnb_usage (reading_datetime, usage_kwh, source_file_date)
+                    VALUES (?, ?, ?)
+                    """,
+                    (dt_iso, usage, file_date),
+                )
+                inserted += 1
+    return inserted
+
+
+def import_solar_folder(conn: sqlite3.Connection, folder: str, data_period: str) -> int:
+    paths = sorted(glob(os.path.join(folder, "*.csv")))
+    inserted = 0
+    for path in paths:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO solar_readings (
+                            plant_name, reading_time, production_w, consumption_w,
+                            grid_flow_w, battery_w, data_period
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["Plant Name"].strip(),
+                            row["Time"].strip(),
+                            float(row["Production (W)"]),
+                            float(row["Consumption (W)"]),
+                            float(row["From Grid[+] / To Grid[-] (W)"]),
+                            float(row["Discharge[+] / Charge[-] (W)"]),
+                            data_period,
+                        ),
+                    )
+                    inserted += 1
+                except (KeyError, ValueError):
+                    continue
+    return inserted
+
+
+def import_november_solar(conn: sqlite3.Connection) -> int:
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM solar_readings WHERE data_period = '2026-11'"
+    )
+    if cur.fetchone()[0] > 0:
+        return 0
+    return import_solar_folder(conn, SOLAR_NOV_DIR, "2026-11")
+
+
+def ensure_database() -> None:
+    if os.path.exists(DB_FILE):
         conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.executescript("""
-        CREATE TABLE IF NOT EXISTS branches (
-            branch_id TEXT PRIMARY KEY,
-            branch_name TEXT NOT NULL,
-            city TEXT NOT NULL,
-            state TEXT NOT NULL,
-            region TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS customers (
-            customer_id TEXT PRIMARY KEY,
-            branch_id TEXT NOT NULL,
-            full_name TEXT NOT NULL,
-            customer_segment TEXT NOT NULL,
-            join_date TEXT NOT NULL,
-            FOREIGN KEY (branch_id) REFERENCES branches(branch_id)
-        );
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_id TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            account_type TEXT NOT NULL,
-            balance REAL NOT NULL,
-            currency TEXT DEFAULT 'MYR',
-            FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-        );
-        INSERT OR IGNORE INTO branches VALUES
-            ('BR_001', 'Petaling Jaya Main', 'Petaling Jaya', 'Selangor', 'Central'),
-            ('BR_002', 'Kepong Metro Prima', 'Kuala Lumpur', 'W.P. Kuala Lumpur', 'Central'),
-            ('BR_003', 'KLCC Corporate Banking', 'Kuala Lumpur', 'W.P. Kuala Lumpur', 'Central'),
-            ('BR_004', 'Georgetown Heritage', 'George Town', 'Penang', 'Northern'),
-            ('BR_005', 'Johor Bahru City Square', 'Johor Bahru', 'Johor', 'Southern');
-        INSERT OR IGNORE INTO customers VALUES
-            ('CUST_901', 'BR_001', 'Tan Wei Ming', 'Premier Banking', '2023-01-15'),
-            ('CUST_902', 'BR_001', 'Ahmad Farhan', 'Mass Affluent', '2023-03-22'),
-            ('CUST_903', 'BR_001', 'Siti Nurhaliza', 'Mass Retail', '2024-06-10'),
-            ('CUST_904', 'BR_001', 'Kavitha Pillai', 'Premier Banking', '2024-08-01'),
-            ('CUST_905', 'BR_002', 'Chong Chee Keong', 'Mass Retail', '2022-11-05'),
-            ('CUST_906', 'BR_002', 'Faridah binti Osman', 'Mass Affluent', '2023-09-19'),
-            ('CUST_907', 'BR_002', 'Lee Kuan Yew', 'Premier Banking', '2024-02-14'),
-            ('CUST_908', 'BR_003', 'Goh Chok Tong', 'Private Wealth', '2021-05-18'),
-            ('CUST_909', 'BR_003', 'Zainal Abidin', 'Corporate Banking', '2022-04-30'),
-            ('CUST_910', 'BR_004', 'Lim Guan Eng', 'Mass Affluent', '2023-07-09');
-        INSERT OR IGNORE INTO accounts VALUES
-            ('ACC_1001', 'CUST_901', 'Savings', 45200.50, 'MYR'),
-            ('ACC_1002', 'CUST_902', 'Current', 12340.00, 'MYR'),
-            ('ACC_1003', 'CUST_903', 'Savings', 6800.75, 'MYR'),
-            ('ACC_1004', 'CUST_904', 'Fixed Deposit', 150000.00, 'MYR'),
-            ('ACC_1005', 'CUST_905', 'Savings', 3200.00, 'MYR'),
-            ('ACC_1006', 'CUST_906', 'Current', 28900.20, 'MYR'),
-            ('ACC_1007', 'CUST_907', 'Fixed Deposit', 300000.00, 'MYR'),
-            ('ACC_1008', 'CUST_908', 'Investment', 1250000.00, 'MYR'),
-            ('ACC_1009', 'CUST_909', 'Corporate Current', 489000.00, 'MYR'),
-            ('ACC_1010', 'CUST_910', 'Savings', 9800.00, 'MYR');
-        """)
-        conn.commit()
+        cur = conn.execute("SELECT value FROM import_metadata WHERE key = 'bootstrap_complete'")
+        if cur.fetchone():
+            conn.close()
+            return
         conn.close()
+
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        _init_schema(conn)
+        import_tnb_csvs(conn)
+        import_solar_folder(conn, SOLAR_OCT_DIR, "2026-10")
+        _seed_roi_assumptions(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO import_metadata (key, value) VALUES ('bootstrap_complete', '1')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def is_sql_mutation(sql_query: str) -> bool:
     cleaned = sql_query.strip().strip(";")
     parsed = sqlparse.parse(cleaned)
     if not parsed:
         return False
-    forbidden = {'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'TRUNCATE', 'PRAGMA', 'REPLACE', 'CREATE'}
+    forbidden = {"DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "PRAGMA", "REPLACE", "CREATE"}
     for stmt in parsed:
-        if stmt.get_type() != 'SELECT':
+        if stmt.get_type() != "SELECT":
             return True
         for token in stmt.flatten():
             if token.value.upper() in forbidden:
                 return True
     return False
 
+
 @mcp.tool()
 def list_tables() -> str:
-    """Discover all currently available tables in the banking database."""
+    """Discover all tables and views in the solar ROI database."""
     ensure_database()
     conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
     cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-    tables = [row[0] for row in cur.fetchall()]
+    cur.execute(
+        """
+        SELECT name, type FROM sqlite_master
+        WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """
+    )
+    objects = [{"name": r[0], "kind": r[1]} for r in cur.fetchall()]
     conn.close()
-    return json.dumps({"status": "success", "tables": tables})
+    return json.dumps({"status": "success", "objects": objects})
+
+
+@mcp.tool()
+def list_datasets() -> str:
+    """List available TNB history range and solar data periods (e.g. 2026-10, 2026-11)."""
+    ensure_database()
+    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT MIN(reading_datetime), MAX(reading_datetime), COUNT(DISTINCT source_file_date) FROM tnb_usage"
+    )
+    tnb = cur.fetchone()
+    cur.execute(
+        """
+        SELECT data_period, MIN(date(reading_time)), MAX(date(reading_time)), COUNT(*)
+        FROM solar_readings GROUP BY data_period ORDER BY data_period
+        """
+    )
+    solar = [
+        {
+            "data_period": r[0],
+            "from_day": r[1],
+            "to_day": r[2],
+            "interval_rows": r[3],
+        }
+        for r in cur.fetchall()
+    ]
+    conn.close()
+    return json.dumps(
+        {
+            "status": "success",
+            "tnb_historical_usage": {
+                "from": tnb[0],
+                "to": tnb[1],
+                "days_loaded": tnb[2],
+            },
+            "solar_station_power": solar,
+            "solar_period_labels": {
+                "partial_solar_am": "07:00–10:00",
+                "peak_solar": "10:00–16:00",
+                "partial_solar_pm": "16:00–19:00",
+                "no_solar": "19:00–07:00",
+            },
+        }
+    )
+
 
 @mcp.tool()
 def describe_table(table_name: str) -> str:
-    """Inspect column names, types, and primary keys for a specified table."""
+    """Inspect columns for a table or view (tnb_usage, solar_readings, roi_assumptions, views)."""
     ensure_database()
     cleaned = table_name.strip().strip("'").strip('"')
     conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
     cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({cleaned});")
-    cols = [{"cid": r[0], "name": r[1], "type": r[2], "pk": r[5]} for r in cur.fetchall()]
+    cur.execute(
+        "SELECT type FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
+        (cleaned,),
+    )
+    meta = cur.fetchone()
+    if not meta:
+        conn.close()
+        return json.dumps({"status": "error", "message": f"Object '{cleaned}' not found."})
+    if meta[0] == "view":
+        cur.execute(f"SELECT * FROM {cleaned} LIMIT 0")
+        cols = [{"name": d[0], "type": ""} for d in cur.description]
+    else:
+        cur.execute(f"PRAGMA table_info({cleaned});")
+        cols = [{"cid": r[0], "name": r[1], "type": r[2], "pk": r[5]} for r in cur.fetchall()]
     conn.close()
-    if not cols:
-        return json.dumps({"status": "error", "message": f"Table '{cleaned}' not found."})
-    return json.dumps({"status": "success", "table": cleaned, "columns": cols})
+    return json.dumps({"status": "success", "object": cleaned, "kind": meta[0], "columns": cols})
+
 
 @mcp.tool()
 def read_query(sql_query: str) -> str:
-    """Execute a read-only SQL SELECT query against the banking database."""
+    """Execute a read-only SQL SELECT against TNB usage, solar readings, ROI assumptions, or views."""
     ensure_database()
     if is_sql_mutation(sql_query):
-        return json.dumps({"status": "blocked", "error": "Mutation queries (DROP, DELETE, UPDATE) are prohibited."})
+        return json.dumps(
+            {"status": "blocked", "error": "Mutation queries (DROP, DELETE, UPDATE) are prohibited."}
+        )
     try:
         conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
         cur = conn.cursor()
@@ -127,14 +348,23 @@ def read_query(sql_query: str) -> str:
         columns = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
         conn.close()
-        return json.dumps({"status": "success", "columns": columns, "rows": [list(r) for r in rows[:50]], "count": len(rows)})
+        return json.dumps(
+            {
+                "status": "success",
+                "columns": columns,
+                "rows": [list(r) for r in rows[:100]],
+                "count": len(rows),
+            }
+        )
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
+
 @mcp.tool()
-def drop_table_admin(table_name: str) -> str:
-    """Admin-only destructive tool. Should be stripped by ADK tool_filter!"""
-    return f"DANGER: Attempted to drop {table_name}"
+def wipe_database_admin() -> str:
+    """Admin-only destructive tool. Should be stripped by ADK tool_filter."""
+    return "DANGER: wipe_database_admin must not be exposed to the agent."
+
 
 if __name__ == "__main__":
     ensure_database()
