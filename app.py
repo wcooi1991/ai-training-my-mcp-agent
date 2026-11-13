@@ -18,6 +18,8 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StdioServerParameters
 from google.genai import types
 
+from guardrails import evaluate_input_guardrails as _guardrail_message_for_text
+
 # ==============================================================================
 # 1. Page Configuration & Safe Secrets Resolution
 # ==============================================================================
@@ -174,18 +176,13 @@ def anonymize_text(text: str) -> str:
 def before_model_guardrail(callback_context, llm_request):
     last_text = ""
     if llm_request.contents and llm_request.contents[-1].parts:
-        last_text = (llm_request.contents[-1].parts[0].text or "").lower()
-    destructive = ["delete", "drop table", "truncate", "modify data", "wipe", "update roi"]
-    if any(k in last_text for k in destructive):
+        last_text = llm_request.contents[-1].parts[0].text or ""
+    blocked_msg = _guardrail_message_for_text(last_text)
+    if blocked_msg:
         return LlmResponse(
             content=types.Content(
                 role="model",
-                parts=[
-                    types.Part(
-                        text="🛡️ **[GUARDRAIL]**: Blocked — this analyst is **read-only**. "
-                        "Use SQL SELECT on MCP views/tables only."
-                    )
-                ],
+                parts=[types.Part(text=blocked_msg)],
             )
         )
     return None
@@ -631,6 +628,8 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "`read_query` only for other TNB/assumption SQL. If `truncation_notice` is present, "
                 "tell the user results were truncated to 10 rows and how to refine. "
                 "Note seasonality limits when extrapolating.\n"
+                "**No shell:** this deployment has **only MCP tools** — you cannot run bash, PowerShell, "
+                "pip, or streamlit. Never ask to execute OS commands; guide setup in prose if needed.\n"
                 "Be concise and quantitative (kWh, RM, payback years)."
             ),
             tools=[mcp_toolset],
@@ -828,26 +827,13 @@ if prompt_to_send:
         st.markdown(prompt_to_send)
 
     with st.chat_message("assistant"):
-        with st.spinner("Preparing database and MCP server…"):
-            ensure_solar_db_ready()
-            reply_text, tools_used, mcp_err, charts, turn_usage = asyncio.run(
-                run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
-            )
-            if turn_usage.get("total") or turn_usage.get("prompt") or turn_usage.get("output"):
-                st.session_state.last_turn_tokens = turn_usage
-                st.session_state.token_usage = _merge_token_usage(
-                    st.session_state.token_usage, turn_usage
-                )
-            else:
-                st.session_state.last_turn_tokens = None
-            if tools_used:
-                st.caption(
-                    "🔌 **MCP calls:** " + " → ".join(f"`{t}`" for t in tools_used)
-                )
-            if mcp_err:
-                with st.expander("⚠️ MCP server stderr (tool may have failed)", expanded=True):
-                    st.code(mcp_err)
-            render_chart_bundle(charts if charts else None)
+        blocked_msg = _guardrail_message_for_text(prompt_to_send)
+        if blocked_msg:
+            reply_text = blocked_msg
+            tools_used: list[str] = []
+            mcp_err = ""
+            charts: dict = {"tnb": None, "solar": None, "compare": None}
+            turn_usage = _zero_token_usage()
             st.markdown(reply_text)
             st.session_state.messages.append(
                 {
@@ -857,5 +843,35 @@ if prompt_to_send:
                     "charts": charts,
                 }
             )
-            if turn_usage.get("total") or turn_usage.get("prompt") or turn_usage.get("output"):
-                st.rerun()
+        else:
+            with st.spinner("Preparing database and MCP server…"):
+                ensure_solar_db_ready()
+                reply_text, tools_used, mcp_err, charts, turn_usage = asyncio.run(
+                    run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
+                )
+                if turn_usage.get("total") or turn_usage.get("prompt") or turn_usage.get("output"):
+                    st.session_state.last_turn_tokens = turn_usage
+                    st.session_state.token_usage = _merge_token_usage(
+                        st.session_state.token_usage, turn_usage
+                    )
+                else:
+                    st.session_state.last_turn_tokens = None
+                if tools_used:
+                    st.caption(
+                        "🔌 **MCP calls:** " + " → ".join(f"`{t}`" for t in tools_used)
+                    )
+                if mcp_err:
+                    with st.expander("⚠️ MCP server stderr (tool may have failed)", expanded=True):
+                        st.code(mcp_err)
+                render_chart_bundle(charts if charts else None)
+                st.markdown(reply_text)
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": reply_text,
+                        "tools_used": tools_used,
+                        "charts": charts,
+                    }
+                )
+                if turn_usage.get("total") or turn_usage.get("prompt") or turn_usage.get("output"):
+                    st.rerun()
