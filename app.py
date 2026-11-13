@@ -361,12 +361,19 @@ def render_solar_summary_charts(payload: dict) -> None:
         long_df = df.melt(id_vars=["day"], value_vars=order, var_name="series_key", value_name="kWh")
         long_df["series"] = long_df["series_key"].map(labels).fillna(long_df["series_key"])
         label_order = [labels.get(k, k) for k in order]
+        x_sort = grouped.get("x_sort") or sorted(df["day"].unique().tolist())
+        x_title = grouped.get("x_title", "Day")
+        y_title = (
+            "Avg kWh"
+            if grouped.get("aggregation") == "weekday_average"
+            else "kWh"
+        )
         bar = (
             alt.Chart(long_df)
             .mark_bar()
             .encode(
-                x=alt.X("day:N", title="Day", sort=sorted(df["day"].unique().tolist())),
-                y=alt.Y("kWh:Q", title="kWh"),
+                x=alt.X("day:N", title=x_title, sort=x_sort),
+                y=alt.Y("kWh:Q", title=y_title),
                 color=alt.Color("series:N", sort=label_order, title="Flow"),
                 xOffset=alt.XOffset("series:N", sort=label_order),
                 tooltip=["day", "series", alt.Tooltip("kWh:Q", format=".2f")],
@@ -378,16 +385,36 @@ def render_solar_summary_charts(payload: dict) -> None:
     line_spec = payload.get("line_production_trend")
     if line_spec and line_spec.get("rows"):
         line_df = pd.DataFrame(line_spec["rows"])
-        line = (
-            alt.Chart(line_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("day:T", title="Day"),
-                y=alt.Y("production_kwh:Q", title="Production (kWh)"),
-                tooltip=["day", alt.Tooltip("production_kwh:Q", format=".2f")],
+        weekday_avg = line_spec.get("aggregation") == "weekday_average"
+        x_sort = line_spec.get("x_sort")
+        x_title = line_spec.get("x_title", "Day")
+        y_title = "Avg production (kWh)" if weekday_avg else "Production (kWh)"
+        if weekday_avg or x_sort:
+            line = (
+                alt.Chart(line_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X(
+                        "day:N",
+                        title=x_title,
+                        sort=x_sort or sorted(line_df["day"].unique().tolist()),
+                    ),
+                    y=alt.Y("production_kwh:Q", title=y_title),
+                    tooltip=["day", alt.Tooltip("production_kwh:Q", format=".2f")],
+                )
+                .properties(height=280, title=line_spec.get("title", "Production trend"))
             )
-            .properties(height=280, title=line_spec.get("title", "Production trend"))
-        )
+        else:
+            line = (
+                alt.Chart(line_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("day:T", title="Day"),
+                    y=alt.Y("production_kwh:Q", title=y_title),
+                    tooltip=["day", alt.Tooltip("production_kwh:Q", format=".2f")],
+                )
+                .properties(height=280, title=line_spec.get("title", "Production trend"))
+            )
         st.altair_chart(line, use_container_width=True)
 
     totals = payload.get("totals") or {}
@@ -485,8 +512,9 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "- **TNB load by daypart:** use `summarize_tnb_by_solar_period(from_date, to_date)` "
                 "(stacked_bar_chart = **weekday average** Mon–Sun; daily detail in JSON). "
                 "Bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
-                "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: grouped daily flows + "
-                "production line). For **Oct vs Nov** (or any two periods), use `compare_solar_periods(a, b)` "
+                "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: **weekday-averaged** "
+                "grouped flows + production line; calendar detail in `daily_rollup`). For **Oct vs Nov**, "
+                "use `compare_solar_periods(a, b)` "
                 "dual production line — not two separate summarizes. Do **not** query `solar_readings` via SQL.\n"
                 "- Other TNB SQL only when needed: `read_query` on `v_tnb_usage_with_period` (aggregates, max 10 rows).\n"
                 "- `roi_assumptions` — rates and investment; `read_query` returns at most **10 rows** "

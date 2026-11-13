@@ -552,6 +552,30 @@ def _fetch_solar_daily_rollup(
     ]
 
 
+def _weekday_average_daily_rows(
+    daily: list[dict], metrics: tuple[str, ...]
+) -> list[dict]:
+    """Average daily metrics by day-of-week (Mon–Sun) across calendar days in daily."""
+    by_weekday: dict[str, list[dict]] = {w: [] for w in WEEKDAY_ORDER}
+    for row in daily:
+        weekday = WEEKDAY_ORDER[datetime.strptime(row["day"], "%Y-%m-%d").weekday()]
+        by_weekday[weekday].append(row)
+
+    out: list[dict] = []
+    for weekday in WEEKDAY_ORDER:
+        samples = by_weekday[weekday]
+        agg = {"day": weekday, "weekday": weekday, "sample_days": len(samples)}
+        if not samples:
+            for key in metrics:
+                agg[key] = 0.0
+        else:
+            n = len(samples)
+            for key in metrics:
+                agg[key] = round(sum(float(s[key]) for s in samples) / n, 3)
+        out.append(agg)
+    return out
+
+
 def _solar_period_has_data(conn: sqlite3.Connection, period: str) -> bool:
     cur = conn.cursor()
     cur.execute(
@@ -570,7 +594,7 @@ def summarize_solar_period(
     """
     Compact solar/inverter summary for a data_period (e.g. 2026-10, 2026-11).
     Returns period totals, daily kWh rollup, generation by daypart, RM savings, and
-    grouped_bar_chart + line_production_trend chart specs for the UI.
+    grouped_bar_chart + line_production_trend averaged by day-of-week (Mon–Sun).
     Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive.
     """
     ensure_database()
@@ -644,6 +668,8 @@ def summarize_solar_period(
 
     conn.close()
 
+    weekday_rows = _weekday_average_daily_rows(daily, SOLAR_DAILY_FLOW_ORDER)
+
     return json.dumps(
         {
             "status": "success",
@@ -653,6 +679,7 @@ def summarize_solar_period(
             "totals": totals,
             "production_kwh_by_daypart": production_by_daypart,
             "daily_rollup": daily,
+            "average_kwh_by_weekday": weekday_rows,
             "estimated_savings_rm": savings_rm,
             "extrapolated_monthly_savings_rm": round(savings_rm / max(totals["days_in_summary"], 1) * 30, 2)
             if savings_rm is not None
@@ -663,17 +690,30 @@ def summarize_solar_period(
                 "export_credit": rates.get("export_credit_atap_rm_per_kwh"),
             },
             "grouped_bar_chart": {
-                "title": f"Daily energy flows (kWh) — {period}",
+                "title": f"Avg daily energy flows by weekday (kWh) — {period}",
                 "x_field": "day",
+                "x_title": "Day of week",
+                "x_sort": list(WEEKDAY_ORDER),
+                "aggregation": "weekday_average",
                 "series_order": list(SOLAR_DAILY_FLOW_ORDER),
                 "series_labels": SOLAR_DAILY_FLOW_LABELS,
-                "rows": daily,
+                "rows": weekday_rows,
             },
             "line_production_trend": {
-                "title": f"Daily production trend (kWh) — {period}",
+                "title": f"Avg production by weekday (kWh) — {period}",
                 "x_field": "day",
+                "x_title": "Day of week",
+                "x_sort": list(WEEKDAY_ORDER),
+                "aggregation": "weekday_average",
                 "y_field": "production_kwh",
-                "rows": [{"day": d["day"], "production_kwh": d["production_kwh"]} for d in daily],
+                "rows": [
+                    {
+                        "day": r["day"],
+                        "production_kwh": r["production_kwh"],
+                        "sample_days": r.get("sample_days", 0),
+                    }
+                    for r in weekday_rows
+                ],
             },
         }
     )
