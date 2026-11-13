@@ -632,6 +632,7 @@ def _build_financial_overview(
     r_import = float(rates.get("import_avoided_rm_per_kwh", 0))
     r_export = float(rates.get("export_credit_atap_rm_per_kwh", 0))
     net_inv = rates.get("net_investment_rm")
+    gross_inv = rates.get("gross_investment_rm")
 
     savings_self = round(self_kwh * r_import, 2)
     savings_export = round(export_kwh * r_export, 2)
@@ -663,13 +664,28 @@ def _build_financial_overview(
             ),
         },
     ]
+    if net_inv is not None:
+        if gross_inv is not None:
+            worked_inv = (
+                f"Gross RM {float(gross_inv):,.0f} − SuRIA rebate "
+                f"→ net investment RM {float(net_inv):,.0f}"
+            )
+        else:
+            worked_inv = f"Net investment = RM {float(net_inv):,.0f} (roi_assumptions)"
+        steps.append(
+            {
+                "step": "Solar panel investment (RM)",
+                "formula": "net_investment ≈ package + install − SuRIA rebate (roi_assumptions)",
+                "worked_example": worked_inv,
+            }
+        )
     if net_inv and monthly_rm and monthly_rm > 0 and payback_years is not None:
         steps.append(
             {
                 "step": "Indicative payback (years)",
                 "formula": "payback ≈ net_investment ÷ (S_month × 12)",
                 "worked_example": (
-                    f"{payback_years:.1f} ≈ {net_inv:.0f} ÷ ({monthly_rm:.2f} × 12)"
+                    f"{payback_years:.1f} ≈ {float(net_inv):,.0f} ÷ ({monthly_rm:.2f} × 12)"
                 ),
             }
         )
@@ -692,6 +708,7 @@ def _build_financial_overview(
             "savings_export_component": savings_export,
             "savings_period_total": savings_rm,
             "extrapolated_monthly": monthly_rm,
+            "gross_investment": gross_inv,
             "net_investment": net_inv,
             "payback_years": payback_years,
         },

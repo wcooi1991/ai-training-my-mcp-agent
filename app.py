@@ -451,13 +451,22 @@ def render_solar_financial_overview(payload: dict) -> None:
 
     amounts = overview.get("amounts_rm") or {}
     st.subheader(overview.get("title", "Estimated Savings & Financial Overview"))
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     if amounts.get("savings_period_total") is not None:
         m1.metric("Savings (period)", f"RM {amounts['savings_period_total']:.2f}")
     if amounts.get("extrapolated_monthly") is not None:
         m2.metric("≈ Monthly savings", f"RM {amounts['extrapolated_monthly']:.2f}")
+    if amounts.get("net_investment") is not None:
+        net_inv = float(amounts["net_investment"])
+        gross = amounts.get("gross_investment")
+        inv_help = (
+            f"Gross RM {float(gross):,.0f} before SuRIA rebate"
+            if gross is not None
+            else "Net cost after SuRIA (roi_assumptions)"
+        )
+        m3.metric("Net investment (panels)", f"RM {net_inv:,.0f}", help=inv_help)
     if amounts.get("payback_years") is not None:
-        m3.metric("Indicative payback", f"{amounts['payback_years']:.1f} years")
+        m4.metric("Indicative payback", f"{amounts['payback_years']:.1f} years")
 
     with st.expander("How this was calculated", expanded=True):
         rates = overview.get("rates_rm_per_kwh") or {}
