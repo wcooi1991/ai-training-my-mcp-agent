@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from glob import glob
 
 import sqlparse
@@ -287,6 +287,60 @@ SOLAR_DAILY_FLOW_LABELS = {
     "self_consumed_kwh": "Self-consumed",
 }
 
+# Guardrail: explicit from/to filters may span at most ~3 calendar months.
+MAX_DATE_RANGE_DAYS = 92
+
+
+def _parse_yyyy_mm_dd(value: str) -> date:
+    return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+
+
+def _date_range_guard_payload(from_date: str, to_date: str) -> dict | None:
+    """Return error payload if invalid or range exceeds MAX_DATE_RANGE_DAYS (inclusive)."""
+    try:
+        start = _parse_yyyy_mm_dd(from_date)
+        end = _parse_yyyy_mm_dd(to_date)
+    except ValueError:
+        return {
+            "status": "error",
+            "message": "Dates must be ISO format YYYY-MM-DD.",
+        }
+    if end < start:
+        return {
+            "status": "error",
+            "message": "to_date must be on or after from_date.",
+        }
+    span_days = (end - start).days + 1
+    if span_days > MAX_DATE_RANGE_DAYS:
+        return {
+            "status": "blocked",
+            "error": (
+                f"Date range spans {span_days} day(s); maximum is {MAX_DATE_RANGE_DAYS} days (~3 months). "
+                "Use a shorter from_date/to_date window or omit both to use the full data_period."
+            ),
+            "max_range_days": MAX_DATE_RANGE_DAYS,
+            "requested_span_days": span_days,
+        }
+    return None
+
+
+def _optional_date_range_guard(
+    from_date: str | None, to_date: str | None
+) -> dict | None:
+    if from_date and not to_date:
+        return {
+            "status": "error",
+            "message": "Provide both from_date and to_date, or omit both.",
+        }
+    if to_date and not from_date:
+        return {
+            "status": "error",
+            "message": "Provide both from_date and to_date, or omit both.",
+        }
+    if from_date and to_date:
+        return _date_range_guard_payload(from_date, to_date)
+    return None
+
 
 def is_sql_mutation(sql_query: str) -> bool:
     cleaned = sql_query.strip().strip(";")
@@ -406,10 +460,14 @@ def summarize_tnb_by_solar_period(from_date: str, to_date: str) -> str:
     """
     TNB import (kWh) by solar daypart between from_date and to_date (YYYY-MM-DD, inclusive).
     Returns daily detail plus stacked_bar_chart averaged by day-of-week (Mon–Sun) for the UI.
+    Date range is limited to 92 days (~3 months) inclusive.
     """
     ensure_database()
     start = from_date.strip()
     end = to_date.strip()
+    blocked = _date_range_guard_payload(start, end)
+    if blocked:
+        return json.dumps(blocked)
     conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
     cur = conn.cursor()
     cur.execute(
@@ -689,10 +747,16 @@ def summarize_solar_period(
     Compact solar/inverter summary for a data_period (e.g. 2026-10, 2026-11).
     Returns period totals, daily kWh rollup, generation by daypart, RM savings, and
     grouped_bar_chart + line_production_trend averaged by day-of-week (Mon–Sun).
-    Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive.
+    Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive (max ~3 months when both set).
     """
     ensure_database()
     period = data_period.strip()
+    range_block = _optional_date_range_guard(
+        from_date.strip() if from_date else None,
+        to_date.strip() if to_date else None,
+    )
+    if range_block:
+        return json.dumps(range_block)
     conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
 
     if not _solar_period_has_data(conn, period):
@@ -825,6 +889,41 @@ def summarize_solar_period(
     )
 
 
+def _financial_metrics_from_daily(
+    daily: list[dict], rates: dict[str, float]
+) -> dict:
+    """Period savings / monthly extrapolation / payback from daily rollup rows."""
+    days = len(daily)
+    if days == 0:
+        return {}
+    totals = {key: round(sum(float(r[key]) for r in daily), 2) for key in SOLAR_DAILY_FLOW_ORDER}
+    r_import = float(rates.get("import_avoided_rm_per_kwh", 0))
+    r_export = float(rates.get("export_credit_atap_rm_per_kwh", 0))
+    net_inv = rates.get("net_investment_rm")
+    savings_period = round(
+        totals["self_consumed_kwh"] * r_import + totals["export_kwh"] * r_export,
+        2,
+    )
+    monthly = round(savings_period / days * 30, 2)
+    payback = None
+    if net_inv and monthly > 0:
+        payback = round(float(net_inv) / (monthly * 12), 1)
+    return {
+        "days": days,
+        "totals_kwh": totals,
+        "savings_period_rm": savings_period,
+        "extrapolated_monthly_savings_rm": monthly,
+        "indicative_payback_years": payback,
+    }
+
+
+def _avg_daily_kwh_by_flow(daily: list[dict]) -> dict[str, float]:
+    if not daily:
+        return {k: 0.0 for k in SOLAR_DAILY_FLOW_ORDER}
+    n = len(daily)
+    return {k: round(sum(float(r[k]) for r in daily) / n, 3) for k in SOLAR_DAILY_FLOW_ORDER}
+
+
 @mcp.tool()
 def compare_solar_periods(
     data_period_a: str,
@@ -833,13 +932,19 @@ def compare_solar_periods(
     to_date: str | None = None,
 ) -> str:
     """
-    Compare daily solar production between two data_period values (e.g. 2026-10 vs 2026-11).
-    Returns totals side-by-side and dual_line_chart rows for overlaid production trends.
-    Optional from_date / to_date filter applied to both periods.
+    Compare two data_period values (e.g. 2026-10 vs 2026-11): energy flows, dual line chart,
+    grouped average-by-flow bar chart, and roi_comparison (monthly savings & payback impact).
+    Optional from_date / to_date (max ~3 months when both set).
     """
     ensure_database()
     period_a = data_period_a.strip()
     period_b = data_period_b.strip()
+    range_block = _optional_date_range_guard(
+        from_date.strip() if from_date else None,
+        to_date.strip() if to_date else None,
+    )
+    if range_block:
+        return json.dumps(range_block)
     conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
 
     missing = [
@@ -857,26 +962,85 @@ def compare_solar_periods(
 
     daily_a = _fetch_solar_daily_rollup(conn, period_a, from_date, to_date)
     daily_b = _fetch_solar_daily_rollup(conn, period_b, from_date, to_date)
+    rates = _fetch_roi_rates(conn)
     conn.close()
 
-    def _sum_metric(rows: list[dict], key: str) -> float:
-        return round(sum(float(r[key]) for r in rows), 2)
+    fin_a = _financial_metrics_from_daily(daily_a, rates)
+    fin_b = _financial_metrics_from_daily(daily_b, rates)
+    monthly_a = fin_a.get("extrapolated_monthly_savings_rm")
+    monthly_b = fin_b.get("extrapolated_monthly_savings_rm")
+    payback_a = fin_a.get("indicative_payback_years")
+    payback_b = fin_b.get("indicative_payback_years")
 
-    line_rows = []
+    delta_monthly = None
+    delta_payback = None
+    if monthly_a is not None and monthly_b is not None:
+        delta_monthly = round(monthly_b - monthly_a, 2)
+    if payback_a is not None and payback_b is not None:
+        delta_payback = round(payback_b - payback_a, 1)
+
+    r_import = rates.get("import_avoided_rm_per_kwh", 0)
+    r_export = rates.get("export_credit_atap_rm_per_kwh", 0)
+    impact_summary = (
+        "ROI uses the same formula as a single-period summary: "
+        f"S = self_consumed × {r_import:.4f} + export × {r_export:.4f} (RM), "
+        "then S_month ≈ S ÷ days × 30 and payback ≈ net_investment ÷ (S_month × 12). "
+        "Comparing periods shows how a shift in yield (production / self-consumption / export) "
+        "changes extrapolated monthly savings and payback—use the lower month when stress-testing seasonality."
+    )
+    if delta_monthly is not None:
+        direction = "higher" if delta_monthly > 0 else "lower" if delta_monthly < 0 else "unchanged"
+        impact_summary += (
+            f" Here, {period_b} vs {period_a}: ≈ RM {abs(delta_monthly):.2f}/month {direction}"
+            + (
+                f"; payback {delta_payback:+.1f} year(s)."
+                if delta_payback is not None
+                else "."
+            )
+        )
+
+    line_rows: list[dict] = []
     for row in daily_a:
-        line_rows.append(
+        for flow_key in SOLAR_DAILY_FLOW_ORDER:
+            line_rows.append(
+                {
+                    "day": row["day"],
+                    "data_period": period_a,
+                    "flow_key": flow_key,
+                    "flow": SOLAR_DAILY_FLOW_LABELS[flow_key],
+                    "kwh": float(row[flow_key]),
+                }
+            )
+    for row in daily_b:
+        for flow_key in SOLAR_DAILY_FLOW_ORDER:
+            line_rows.append(
+                {
+                    "day": row["day"],
+                    "data_period": period_b,
+                    "flow_key": flow_key,
+                    "flow": SOLAR_DAILY_FLOW_LABELS[flow_key],
+                    "kwh": float(row[flow_key]),
+                }
+            )
+
+    avg_a = _avg_daily_kwh_by_flow(daily_a)
+    avg_b = _avg_daily_kwh_by_flow(daily_b)
+    grouped_rows: list[dict] = []
+    for flow_key in SOLAR_DAILY_FLOW_ORDER:
+        grouped_rows.append(
             {
-                "day": row["day"],
                 "data_period": period_a,
-                "production_kwh": row["production_kwh"],
+                "flow_key": flow_key,
+                "flow": SOLAR_DAILY_FLOW_LABELS[flow_key],
+                "avg_daily_kwh": avg_a[flow_key],
             }
         )
-    for row in daily_b:
-        line_rows.append(
+        grouped_rows.append(
             {
-                "day": row["day"],
                 "data_period": period_b,
-                "production_kwh": row["production_kwh"],
+                "flow_key": flow_key,
+                "flow": SOLAR_DAILY_FLOW_LABELS[flow_key],
+                "avg_daily_kwh": avg_b[flow_key],
             }
         )
 
@@ -887,24 +1051,47 @@ def compare_solar_periods(
             "data_period_b": period_b,
             "from_date": from_date,
             "to_date": to_date,
+            "period_a_financials": fin_a,
+            "period_b_financials": fin_b,
             "period_a_totals": {
-                "days": len(daily_a),
-                "production_kwh": _sum_metric(daily_a, "production_kwh"),
-                "export_kwh": _sum_metric(daily_a, "export_kwh"),
-                "self_consumed_kwh": _sum_metric(daily_a, "self_consumed_kwh"),
+                "days": fin_a.get("days", 0),
+                **(fin_a.get("totals_kwh") or {k: 0.0 for k in SOLAR_DAILY_FLOW_ORDER}),
             },
             "period_b_totals": {
-                "days": len(daily_b),
-                "production_kwh": _sum_metric(daily_b, "production_kwh"),
-                "export_kwh": _sum_metric(daily_b, "export_kwh"),
-                "self_consumed_kwh": _sum_metric(daily_b, "self_consumed_kwh"),
+                "days": fin_b.get("days", 0),
+                **(fin_b.get("totals_kwh") or {k: 0.0 for k in SOLAR_DAILY_FLOW_ORDER}),
+            },
+            "roi_comparison": {
+                "impact_summary": impact_summary,
+                "formula": "S = self_consumed_kwh × R_avoided + export_kwh × R_export; S_month ≈ S ÷ days × 30",
+                "rates_rm_per_kwh": {
+                    "import_avoided": r_import,
+                    "export_credit_atap": r_export,
+                },
+                "period_a_monthly_rm": monthly_a,
+                "period_b_monthly_rm": monthly_b,
+                "delta_monthly_rm": delta_monthly,
+                "period_a_payback_years": payback_a,
+                "period_b_payback_years": payback_b,
+                "delta_payback_years": delta_payback,
             },
             "dual_line_chart": {
-                "title": f"Daily production — {period_a} vs {period_b}",
+                "title": f"Daily energy flows — {period_a} vs {period_b}",
                 "x_field": "day",
-                "y_field": "production_kwh",
+                "y_field": "kwh",
                 "series_field": "data_period",
+                "stroke_field": "flow",
                 "rows": line_rows,
+            },
+            "grouped_period_average_chart": {
+                "title": f"Average daily kWh by flow — {period_a} vs {period_b}",
+                "x_field": "flow",
+                "series_field": "data_period",
+                "y_field": "avg_daily_kwh",
+                "series_order": [period_a, period_b],
+                "flow_order": list(SOLAR_DAILY_FLOW_ORDER),
+                "flow_labels": SOLAR_DAILY_FLOW_LABELS,
+                "rows": grouped_rows,
             },
         }
     )

@@ -1,4 +1,4 @@
-
+﻿
 import asyncio
 import json
 import os
@@ -478,33 +478,85 @@ def render_solar_financial_overview(payload: dict) -> None:
 
 
 def render_solar_compare_chart(payload: dict) -> None:
-    spec = payload.get("dual_line_chart")
-    if not spec or not spec.get("rows"):
-        return
-    line_df = pd.DataFrame(spec["rows"])
-    chart = (
-        alt.Chart(line_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("day:T", title="Day"),
-            y=alt.Y("production_kwh:Q", title="Production (kWh)"),
-            color=alt.Color("data_period:N", title="Period"),
-            tooltip=["day", "data_period", alt.Tooltip("production_kwh:Q", format=".2f")],
+    roi = payload.get("roi_comparison") or {}
+    if roi:
+        st.subheader("ROI impact of period comparison")
+        st.caption(roi.get("impact_summary", ""))
+        st.code(roi.get("formula", ""), language=None)
+        m1, m2, m3 = st.columns(3)
+        pa = payload.get("data_period_a", "A")
+        pb = payload.get("data_period_b", "B")
+        if roi.get("period_a_monthly_rm") is not None:
+            m1.metric(f"{pa} ≈ monthly", f"RM {roi['period_a_monthly_rm']:.2f}")
+        if roi.get("period_b_monthly_rm") is not None:
+            m2.metric(f"{pb} ≈ monthly", f"RM {roi['period_b_monthly_rm']:.2f}")
+        if roi.get("delta_monthly_rm") is not None:
+            m3.metric("Δ monthly", f"RM {roi['delta_monthly_rm']:+.2f}")
+        if roi.get("period_a_payback_years") is not None and roi.get("period_b_payback_years") is not None:
+            p1, p2, p3 = st.columns(3)
+            p1.metric(f"{pa} payback", f"{roi['period_a_payback_years']:.1f} yr")
+            p2.metric(f"{pb} payback", f"{roi['period_b_payback_years']:.1f} yr")
+            if roi.get("delta_payback_years") is not None:
+                p3.metric("Δ payback", f"{roi['delta_payback_years']:+.1f} yr")
+
+    grouped = payload.get("grouped_period_average_chart")
+    if grouped and grouped.get("rows"):
+        gdf = pd.DataFrame(grouped["rows"])
+        flow_labels = grouped.get("flow_labels") or {}
+        label_order = [flow_labels.get(k, k) for k in grouped.get("flow_order") or []]
+        period_order = grouped.get("series_order") or sorted(
+            gdf["data_period"].unique().tolist()
         )
-        .properties(height=360, title=spec.get("title", "Production comparison"))
-    )
-    st.altair_chart(chart, use_container_width=True)
+        bar = (
+            alt.Chart(gdf)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "flow:N",
+                    title="Energy flow",
+                    sort=label_order,
+                ),
+                y=alt.Y("avg_daily_kwh:Q", title="Avg daily kWh"),
+                color=alt.Color("data_period:N", title="Period"),
+                xOffset=alt.XOffset("data_period:N", sort=period_order),
+                tooltip=["data_period", "flow", alt.Tooltip("avg_daily_kwh:Q", format=".2f")],
+            )
+            .properties(
+                height=320,
+                title=grouped.get("title", "Average daily flows by period"),
+            )
+        )
+        st.altair_chart(bar, use_container_width=True)
+
+    spec = payload.get("dual_line_chart")
+    if spec and spec.get("rows"):
+        line_df = pd.DataFrame(spec["rows"])
+        y_field = spec.get("y_field", "kwh")
+        stroke_field = spec.get("stroke_field", "flow")
+        chart = (
+            alt.Chart(line_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("day:T", title="Day"),
+                y=alt.Y(f"{y_field}:Q", title="kWh"),
+                color=alt.Color("data_period:N", title="Period"),
+                strokeDash=alt.StrokeDash(f"{stroke_field}:N", title="Flow"),
+                tooltip=["day", "data_period", stroke_field, alt.Tooltip(f"{y_field}:Q", format=".2f")],
+            )
+            .properties(height=380, title=spec.get("title", "Period comparison"))
+        )
+        st.altair_chart(chart, use_container_width=True)
 
     a = payload.get("period_a_totals") or {}
     b = payload.get("period_b_totals") or {}
     if a and b:
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"**{payload.get('data_period_a', 'A')}**")
-            st.metric("Total production", f"{a.get('production_kwh', 0):.1f} kWh")
+            st.markdown(f"**{payload.get('data_period_a', 'A')}** (period totals)")
+            st.metric("Production", f"{a.get('production_kwh', 0):.1f} kWh")
         with c2:
-            st.markdown(f"**{payload.get('data_period_b', 'B')}**")
-            st.metric("Total production", f"{b.get('production_kwh', 0):.1f} kWh")
+            st.markdown(f"**{payload.get('data_period_b', 'B')}** (period totals)")
+            st.metric("Production", f"{b.get('production_kwh', 0):.1f} kWh")
 
 
 def render_chart_bundle(bundle: dict | None) -> None:
@@ -565,8 +617,9 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "Bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
                 "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: **weekday-averaged** "
                 "grouped flows + production line; calendar detail in `daily_rollup`). For **Oct vs Nov**, "
-                "use `compare_solar_periods(a, b)` "
-                "dual production line — not two separate summarizes. Financial figures must match "
+                "use `compare_solar_periods(a, b)` (multi-flow line chart, grouped averages, "
+                "`roi_comparison`) — not two separate summarizes. When explaining ROI impact, cite "
+                "`roi_comparison.impact_summary` concisely (monthly savings & payback deltas). Financial figures must match "
                 "`financial_overview` from the tool — do not recompute rates in prose. Do **not** query "
                 "`solar_readings` via SQL.\n"
                 "- Other TNB SQL only when needed: `read_query` on `v_tnb_usage_with_period` (aggregates, max 10 rows).\n"
