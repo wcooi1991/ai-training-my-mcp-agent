@@ -129,7 +129,13 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str]]
             command=sys.executable,
             args=[MCP_SERVER_SCRIPT, DB_FILE],
         ),
-        tool_filter=["list_tables", "list_datasets", "describe_table", "read_query"],
+        tool_filter=[
+            "list_tables",
+            "list_datasets",
+            "describe_table",
+            "summarize_solar_period",
+            "read_query",
+        ],
         errlog=subprocess.DEVNULL,
     )
 
@@ -146,13 +152,15 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str]]
                 "**Data via MCP (read-only SQL):**\n"
                 "- `tnb_usage` — pre-solar household import (30-min kWh); use view `v_tnb_usage_with_period` for "
                 "bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
-                "- `solar_readings` — 5-min inverter logs; `data_period` **2026-10** (October baseline) and "
-                "**2026-11** (November) when loaded. Positive `grid_flow_w` = import; negative = export.\n"
-                "- Views: `v_solar_daily_totals`, `v_solar_interval_kwh` (kWh per interval).\n"
-                "- `roi_assumptions` — RM/kWh rates and investment figures (e.g. export 0.2703, import avoided 0.4443).\n\n"
-                "**Workflow:** call `list_datasets` first when unsure what is loaded; `list_tables` / `describe_table`; "
-                "then `read_query`. For monthly savings: self_consumed_kwh × import_avoided + export_kwh × export_credit. "
-                "Cite assumptions from `roi_assumptions` and note seasonality limits from the assumptions doc when relevant.\n"
+                "- **Solar inverter data:** always use `summarize_solar_period(data_period)` (e.g. `2026-10`, `2026-11`); "
+                "optional `from_date` / `to_date` (YYYY-MM-DD). Do **not** query table `solar_readings` via SQL.\n"
+                "- TNB: `tnb_usage` / view `v_tnb_usage_with_period` via `read_query` (aggregates preferred).\n"
+                "- `roi_assumptions` — rates and investment; `read_query` returns at most **10 rows** "
+                "(tool JSON includes `truncation_notice` when more rows matched).\n\n"
+                "**Workflow:** `list_datasets` when unsure what's loaded → `summarize_solar_period` for solar ROI → "
+                "`read_query` only for TNB patterns or assumptions. If `truncation_notice` is present, "
+                "tell the user results were truncated to 10 rows and how to refine. "
+                "Note seasonality limits when extrapolating.\n"
                 "Be concise and quantitative (kWh, RM, payback years)."
             ),
             tools=[mcp_toolset],
@@ -228,9 +236,8 @@ with st.sidebar:
     prompts = [
         "What datasets and date ranges are currently loaded?",
         "Average daily TNB usage (kWh) by solar_period for the last week of August 2026.",
-        "October 2026: total production, grid import, and export in kWh.",
-        "Estimate October monthly savings using roi_assumptions rates.",
-        "Compare self-consumed vs exported energy for 2026-10 vs 2026-11 (if November is loaded).",
+        "Summarize data_period 2026-10: production, import, export, and estimated savings.",
+        "Compare summarize_solar_period for 2026-10 vs 2026-11 (if November is loaded).",
         "drop table solar_readings",
     ]
     for p in prompts:

@@ -230,6 +230,11 @@ def ensure_database() -> None:
         conn.close()
 
 
+READ_QUERY_ROW_CAP = 10
+
+SOLAR_RAW_BLOCKLIST = ("solar_readings", "v_solar_interval_kwh")
+
+
 def is_sql_mutation(sql_query: str) -> bool:
     cleaned = sql_query.strip().strip(";")
     parsed = sqlparse.parse(cleaned)
@@ -243,6 +248,33 @@ def is_sql_mutation(sql_query: str) -> bool:
             if token.value.upper() in forbidden:
                 return True
     return False
+
+
+def blocks_solar_interval_dump(sql_query: str) -> str | None:
+    """Reject queries that would pull 5-min inverter rows into the LLM context."""
+    normalized = sql_query.lower()
+    for name in SOLAR_RAW_BLOCKLIST:
+        if name in normalized:
+            return (
+                f"Query references `{name}` (interval-level data). "
+                "Use `summarize_solar_period` with data_period instead."
+            )
+    return None
+
+
+def _fetch_roi_rates(conn: sqlite3.Connection) -> dict[str, float]:
+    cur = conn.cursor()
+    keys = ("export_credit_atap_rm_per_kwh", "import_avoided_rm_per_kwh", "net_investment_rm")
+    out: dict[str, float] = {}
+    for key in keys:
+        cur.execute(
+            "SELECT assumption_value FROM roi_assumptions WHERE assumption_key = ?",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            out[key] = float(row[0])
+    return out
 
 
 @mcp.tool()
@@ -334,13 +366,154 @@ def describe_table(table_name: str) -> str:
 
 
 @mcp.tool()
+def summarize_solar_period(
+    data_period: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> str:
+    """
+    Compact solar/inverter summary for a data_period (e.g. 2026-10, 2026-11).
+    Returns period totals, daily kWh rollup (one row per day), generation by daypart,
+    and estimated RM savings using roi_assumptions rates. Does not return 5-min rows.
+    Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive.
+    """
+    ensure_database()
+    period = data_period.strip()
+    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM solar_readings
+        WHERE data_period = ?
+        """,
+        (period,),
+    )
+    if cur.fetchone()[0] == 0:
+        conn.close()
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"No solar_readings for data_period '{period}'. "
+                "Call list_datasets; load November via app if needed.",
+            }
+        )
+
+    daily_sql = """
+        SELECT day, production_kwh, import_kwh, export_kwh, self_consumed_kwh
+        FROM v_solar_daily_totals
+        WHERE data_period = ?
+    """
+    params: list[str] = [period]
+    if from_date:
+        daily_sql += " AND day >= ?"
+        params.append(from_date.strip())
+    if to_date:
+        daily_sql += " AND day <= ?"
+        params.append(to_date.strip())
+    daily_sql += " ORDER BY day"
+
+    cur.execute(daily_sql, params)
+    daily_rows = cur.fetchall()
+
+    totals = {
+        "production_kwh": round(sum(r[1] for r in daily_rows), 2),
+        "import_kwh": round(sum(r[2] for r in daily_rows), 2),
+        "export_kwh": round(sum(r[3] for r in daily_rows), 2),
+        "self_consumed_kwh": round(sum(r[4] for r in daily_rows), 2),
+        "days_in_summary": len(daily_rows),
+    }
+
+    band_sql = """
+        SELECT
+            CASE
+                WHEN CAST(strftime('%H', reading_time) AS INTEGER) >= 7
+                     AND CAST(strftime('%H', reading_time) AS INTEGER) < 10 THEN 'partial_solar_am'
+                WHEN CAST(strftime('%H', reading_time) AS INTEGER) >= 10
+                     AND CAST(strftime('%H', reading_time) AS INTEGER) < 16 THEN 'peak_solar'
+                WHEN CAST(strftime('%H', reading_time) AS INTEGER) >= 16
+                     AND CAST(strftime('%H', reading_time) AS INTEGER) < 19 THEN 'partial_solar_pm'
+                ELSE 'no_solar'
+            END AS band,
+            ROUND(SUM(production_w) / 12000.0, 2) AS production_kwh
+        FROM solar_readings
+        WHERE data_period = ?
+    """
+    band_params: list[str] = [period]
+    if from_date:
+        band_sql += " AND date(reading_time) >= ?"
+        band_params.append(from_date.strip())
+    if to_date:
+        band_sql += " AND date(reading_time) <= ?"
+        band_params.append(to_date.strip())
+    band_sql += " GROUP BY band ORDER BY band"
+
+    cur.execute(band_sql, band_params)
+    production_by_daypart = {r[0]: r[1] for r in cur.fetchall()}
+
+    rates = _fetch_roi_rates(conn)
+    savings_rm = None
+    payback_years = None
+    if "export_credit_atap_rm_per_kwh" in rates and "import_avoided_rm_per_kwh" in rates:
+        savings_rm = round(
+            totals["self_consumed_kwh"] * rates["import_avoided_rm_per_kwh"]
+            + totals["export_kwh"] * rates["export_credit_atap_rm_per_kwh"],
+            2,
+        )
+        monthly_rm = savings_rm / max(totals["days_in_summary"], 1) * 30
+        if monthly_rm > 0 and "net_investment_rm" in rates:
+            payback_years = round(rates["net_investment_rm"] / (monthly_rm * 12), 1)
+
+    conn.close()
+
+    daily = [
+        {
+            "day": r[0],
+            "production_kwh": r[1],
+            "import_kwh": r[2],
+            "export_kwh": r[3],
+            "self_consumed_kwh": r[4],
+        }
+        for r in daily_rows
+    ]
+
+    return json.dumps(
+        {
+            "status": "success",
+            "data_period": period,
+            "from_date": from_date,
+            "to_date": to_date,
+            "totals": totals,
+            "production_kwh_by_daypart": production_by_daypart,
+            "daily_rollup": daily,
+            "estimated_savings_rm": savings_rm,
+            "extrapolated_monthly_savings_rm": round(savings_rm / max(totals["days_in_summary"], 1) * 30, 2)
+            if savings_rm is not None
+            else None,
+            "indicative_payback_years_from_period": payback_years,
+            "rates_used_rm_per_kwh": {
+                "import_avoided": rates.get("import_avoided_rm_per_kwh"),
+                "export_credit": rates.get("export_credit_atap_rm_per_kwh"),
+            },
+        }
+    )
+
+
+@mcp.tool()
 def read_query(sql_query: str) -> str:
-    """Execute a read-only SQL SELECT against TNB usage, solar readings, ROI assumptions, or views."""
+    """
+    Read-only SQL for TNB usage, roi_assumptions, and aggregate views
+    (e.g. v_tnb_usage_with_period, v_solar_daily_totals with filters).
+    For inverter/solar station metrics by month, use summarize_solar_period—not raw solar_readings.
+    """
     ensure_database()
     if is_sql_mutation(sql_query):
         return json.dumps(
             {"status": "blocked", "error": "Mutation queries (DROP, DELETE, UPDATE) are prohibited."}
         )
+    solar_block = blocks_solar_interval_dump(sql_query)
+    if solar_block:
+        return json.dumps({"status": "blocked", "error": solar_block})
     try:
         conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
         cur = conn.cursor()
@@ -348,12 +521,21 @@ def read_query(sql_query: str) -> str:
         columns = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
         conn.close()
+        truncated = len(rows) > READ_QUERY_ROW_CAP
         return json.dumps(
             {
                 "status": "success",
                 "columns": columns,
-                "rows": [list(r) for r in rows[:100]],
+                "rows": [list(r) for r in rows[:READ_QUERY_ROW_CAP]],
                 "count": len(rows),
+                "row_cap": READ_QUERY_ROW_CAP,
+                "truncated": truncated,
+                "truncation_notice": (
+                    f"Result set has {len(rows)} rows; only the first {READ_QUERY_ROW_CAP} are returned. "
+                    "Add GROUP BY / aggregates, tighten WHERE, or use summarize_solar_period for solar totals."
+                )
+                if truncated
+                else None,
             }
         )
     except Exception as e:
