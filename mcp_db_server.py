@@ -317,7 +317,13 @@ def blocks_solar_interval_dump(sql_query: str) -> str | None:
 
 def _fetch_roi_rates(conn: sqlite3.Connection) -> dict[str, float]:
     cur = conn.cursor()
-    keys = ("export_credit_atap_rm_per_kwh", "import_avoided_rm_per_kwh", "net_investment_rm")
+    keys = (
+        "export_credit_atap_rm_per_kwh",
+        "import_avoided_rm_per_kwh",
+        "net_investment_rm",
+        "gross_investment_rm",
+        "suria_rebate_rm",
+    )
     out: dict[str, float] = {}
     for key in keys:
         cur.execute(
@@ -552,6 +558,94 @@ def _fetch_solar_daily_rollup(
     ]
 
 
+def _build_financial_overview(
+    totals: dict,
+    rates: dict[str, float],
+    savings_rm: float | None,
+    monthly_rm: float | None,
+    payback_years: float | None,
+    days_in_summary: int,
+    data_period: str,
+) -> dict:
+    """Structured savings math for UI (matches roi-calculation-assumptions.md)."""
+    production = float(totals.get("production_kwh", 0))
+    export_kwh = float(totals.get("export_kwh", 0))
+    self_kwh = float(totals.get("self_consumed_kwh", 0))
+    r_import = float(rates.get("import_avoided_rm_per_kwh", 0))
+    r_export = float(rates.get("export_credit_atap_rm_per_kwh", 0))
+    net_inv = rates.get("net_investment_rm")
+
+    savings_self = round(self_kwh * r_import, 2)
+    savings_export = round(export_kwh * r_export, 2)
+
+    steps = [
+        {
+            "step": "Self-consumed energy (kWh)",
+            "formula": "self_consumed_kwh = production_kwh − export_kwh",
+            "worked_example": (
+                f"{self_kwh:.2f} = {production:.2f} − {export_kwh:.2f}"
+            ),
+        },
+        {
+            "step": "Savings in period (RM)",
+            "formula": "S_period = self_consumed_kwh × R_avoided + export_kwh × R_export",
+            "worked_example": (
+                f"S_period = ({self_kwh:.2f} × {r_import:.4f}) + ({export_kwh:.2f} × {r_export:.4f}) "
+                f"= {savings_self:.2f} + {savings_export:.2f}"
+                + (f" = {savings_rm:.2f} RM" if savings_rm is not None else "")
+            ),
+        },
+        {
+            "step": "Extrapolated monthly savings (RM)",
+            "formula": "S_month ≈ S_period ÷ days_in_summary × 30",
+            "worked_example": (
+                f"S_month ≈ {savings_rm:.2f} ÷ {days_in_summary} × 30 = {monthly_rm:.2f} RM"
+                if savings_rm is not None and monthly_rm is not None and days_in_summary
+                else "—"
+            ),
+        },
+    ]
+    if net_inv and monthly_rm and monthly_rm > 0 and payback_years is not None:
+        steps.append(
+            {
+                "step": "Indicative payback (years)",
+                "formula": "payback ≈ net_investment ÷ (S_month × 12)",
+                "worked_example": (
+                    f"{payback_years:.1f} ≈ {net_inv:.0f} ÷ ({monthly_rm:.2f} × 12)"
+                ),
+            }
+        )
+
+    return {
+        "title": "Estimated Savings & Financial Overview",
+        "data_period": data_period,
+        "days_in_summary": days_in_summary,
+        "rates_rm_per_kwh": {
+            "import_avoided": r_import,
+            "export_credit_atap": r_export,
+        },
+        "energy_kwh": {
+            "production": production,
+            "export": export_kwh,
+            "self_consumed": self_kwh,
+        },
+        "amounts_rm": {
+            "savings_self_consumed_component": savings_self,
+            "savings_export_component": savings_export,
+            "savings_period_total": savings_rm,
+            "extrapolated_monthly": monthly_rm,
+            "net_investment": net_inv,
+            "payback_years": payback_years,
+        },
+        "calculation_steps": steps,
+        "caveats": [
+            "Rates from roi_assumptions; confirm against your TNB / ATAP bill.",
+            "Monthly extrapolation treats this window as typical; monsoon months may differ.",
+            "Excludes panel degradation, tariff changes, fixed charges, and inverter replacement.",
+        ],
+    }
+
+
 def _weekday_average_daily_rows(
     daily: list[dict], metrics: tuple[str, ...]
 ) -> list[dict]:
@@ -665,10 +759,23 @@ def summarize_solar_period(
         monthly_rm = savings_rm / max(totals["days_in_summary"], 1) * 30
         if monthly_rm > 0 and "net_investment_rm" in rates:
             payback_years = round(rates["net_investment_rm"] / (monthly_rm * 12), 1)
+    else:
+        monthly_rm = None
 
     conn.close()
 
     weekday_rows = _weekday_average_daily_rows(daily, SOLAR_DAILY_FLOW_ORDER)
+    financial_overview = None
+    if savings_rm is not None:
+        financial_overview = _build_financial_overview(
+            totals,
+            rates,
+            savings_rm,
+            round(monthly_rm, 2) if monthly_rm is not None else None,
+            payback_years,
+            totals["days_in_summary"],
+            period,
+        )
 
     return json.dumps(
         {
@@ -681,10 +788,9 @@ def summarize_solar_period(
             "daily_rollup": daily,
             "average_kwh_by_weekday": weekday_rows,
             "estimated_savings_rm": savings_rm,
-            "extrapolated_monthly_savings_rm": round(savings_rm / max(totals["days_in_summary"], 1) * 30, 2)
-            if savings_rm is not None
-            else None,
+            "extrapolated_monthly_savings_rm": round(monthly_rm, 2) if monthly_rm is not None else None,
             "indicative_payback_years_from_period": payback_years,
+            "financial_overview": financial_overview,
             "rates_used_rm_per_kwh": {
                 "import_avoided": rates.get("import_avoided_rm_per_kwh"),
                 "export_credit": rates.get("export_credit_atap_rm_per_kwh"),

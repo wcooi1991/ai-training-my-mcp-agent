@@ -249,24 +249,42 @@ def _merge_token_usage(base: dict, delta: dict) -> dict:
     }
 
 
+def _gemini_cost_rates_usd_per_1m() -> tuple[float, float]:
+    """Illustrative Gemini list rates (USD per 1M tokens); override in Streamlit secrets."""
+    try:
+        inp = float(st.secrets.get("GEMINI_INPUT_USD_PER_1M", 0.10))
+        out = float(st.secrets.get("GEMINI_OUTPUT_USD_PER_1M", 0.40))
+    except Exception:
+        inp, out = 0.10, 0.40
+    return inp, out
+
+
+def _estimate_cost_usd(prompt_tokens: int, output_tokens: int) -> float:
+    in_rate, out_rate = _gemini_cost_rates_usd_per_1m()
+    return (prompt_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
+
+
 def render_sidebar_token_usage() -> None:
-    st.markdown("---")
-    st.caption("**Token usage**")
+    st.caption("**Token & cost telemetry**")
     session = st.session_state.get("token_usage") or _zero_token_usage()
     last = st.session_state.get("last_turn_tokens")
+    session_cost = _estimate_cost_usd(session.get("prompt", 0), session.get("output", 0))
     c1, c2 = st.columns(2)
-    c1.metric("Session total", f"{session.get('total', 0):,}")
-    c2.metric("Session in", f"{session.get('prompt', 0):,}")
+    c1.metric("Session tokens", f"{session.get('total', 0):,}")
+    c2.metric("Est. session cost", f"${session_cost:.4f}")
     c3, c4 = st.columns(2)
-    c3.metric("Session out", f"{session.get('output', 0):,}")
+    c3.metric("In / Out", f"{session.get('prompt', 0):,} / {session.get('output', 0):,}")
     c4.metric("LLM calls", f"{session.get('llm_calls', 0):,}")
     if last and last.get("total"):
+        last_cost = _estimate_cost_usd(last.get("prompt", 0), last.get("output", 0))
         st.caption(
-            f"Last turn: **{last['total']:,}** total "
-            f"({last.get('prompt', 0):,} in / {last.get('output', 0):,} out)"
+            f"Last turn: **{last['total']:,}** tokens "
+            f"({last.get('prompt', 0):,} in / {last.get('output', 0):,} out) · "
+            f"≈ **${last_cost:.4f}**"
         )
     else:
         st.caption("Last turn: —")
+    st.markdown("---")
 
 
 def _function_call_args(raw) -> dict:
@@ -425,6 +443,39 @@ def render_solar_summary_charts(payload: dict) -> None:
         cols[2].metric("Export", f"{totals.get('export_kwh', 0):.1f} kWh")
         cols[3].metric("Self-consumed", f"{totals.get('self_consumed_kwh', 0):.1f} kWh")
 
+    render_solar_financial_overview(payload)
+
+
+def render_solar_financial_overview(payload: dict) -> None:
+    overview = payload.get("financial_overview")
+    if not overview:
+        return
+
+    amounts = overview.get("amounts_rm") or {}
+    st.subheader(overview.get("title", "Estimated Savings & Financial Overview"))
+    m1, m2, m3 = st.columns(3)
+    if amounts.get("savings_period_total") is not None:
+        m1.metric("Savings (period)", f"RM {amounts['savings_period_total']:.2f}")
+    if amounts.get("extrapolated_monthly") is not None:
+        m2.metric("≈ Monthly savings", f"RM {amounts['extrapolated_monthly']:.2f}")
+    if amounts.get("payback_years") is not None:
+        m3.metric("Indicative payback", f"{amounts['payback_years']:.1f} years")
+
+    with st.expander("How this was calculated", expanded=True):
+        rates = overview.get("rates_rm_per_kwh") or {}
+        st.caption(
+            f"Rates used: **R_avoided** = RM {rates.get('import_avoided', 0):.4f}/kWh (self-consumed), "
+            f"**R_export** = RM {rates.get('export_credit_atap', 0):.4f}/kWh (ATAP export credit). "
+            f"Window: **{overview.get('days_in_summary', '—')}** day(s) in **{overview.get('data_period', '')}**."
+        )
+        for i, step in enumerate(overview.get("calculation_steps") or [], start=1):
+            st.markdown(f"{i}. **{step.get('step', 'Step')}**")
+            st.code(step.get("formula", ""), language=None)
+            if step.get("worked_example"):
+                st.markdown(f"→ {step['worked_example']}")
+        for note in overview.get("caveats") or []:
+            st.caption(f"• {note}")
+
 
 def render_solar_compare_chart(payload: dict) -> None:
     spec = payload.get("dual_line_chart")
@@ -515,7 +566,9 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: **weekday-averaged** "
                 "grouped flows + production line; calendar detail in `daily_rollup`). For **Oct vs Nov**, "
                 "use `compare_solar_periods(a, b)` "
-                "dual production line — not two separate summarizes. Do **not** query `solar_readings` via SQL.\n"
+                "dual production line — not two separate summarizes. Financial figures must match "
+                "`financial_overview` from the tool — do not recompute rates in prose. Do **not** query "
+                "`solar_readings` via SQL.\n"
                 "- Other TNB SQL only when needed: `read_query` on `v_tnb_usage_with_period` (aggregates, max 10 rows).\n"
                 "- `roi_assumptions` — rates and investment; `read_query` returns at most **10 rows** "
                 "(tool JSON includes `truncation_notice` when more rows matched).\n\n"
@@ -639,6 +692,7 @@ if "last_turn_tokens" not in st.session_state:
 
 with st.sidebar:
     st.title("☀️ Solar ROI MCP")
+    render_sidebar_token_usage()
     st.caption("ADK `McpToolset` ↔ inverter + TNB SQLite")
     st.caption(f"Python: `{sys.executable}`")
     st.markdown("---")
@@ -750,6 +804,5 @@ if prompt_to_send:
                     "charts": charts,
                 }
             )
-
-with st.sidebar:
-    render_sidebar_token_usage()
+            if turn_usage.get("total") or turn_usage.get("prompt") or turn_usage.get("output"):
+                st.rerun()
