@@ -208,13 +208,20 @@ def import_november_solar(conn: sqlite3.Connection) -> int:
 
 
 def ensure_database() -> None:
+    """Load CSVs into SQLite once. Called from tools (not before mcp.run — keeps stdio handshake fast)."""
     if os.path.exists(DB_FILE):
         conn = sqlite3.connect(DB_FILE)
-        cur = conn.execute("SELECT value FROM import_metadata WHERE key = 'bootstrap_complete'")
-        if cur.fetchone():
+        try:
+            cur = conn.execute(
+                "SELECT value FROM import_metadata WHERE key = 'bootstrap_complete'"
+            )
+            if cur.fetchone():
+                return
+        except sqlite3.OperationalError:
+            pass
+        finally:
             conn.close()
-            return
-        conn.close()
+        os.remove(DB_FILE)
 
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -549,5 +556,6 @@ def wipe_database_admin() -> str:
 
 
 if __name__ == "__main__":
-    ensure_database()
+    # Banking demo called ensure_database() here; that was instant. Solar CSV import is
+    # heavy — run it from tool handlers (or Streamlit pre-warm) so ADK can connect first.
     mcp.run(transport="stdio")

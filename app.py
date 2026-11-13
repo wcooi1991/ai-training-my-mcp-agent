@@ -5,6 +5,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 import streamlit as st
 from google.adk.agents import Agent
@@ -48,9 +49,76 @@ MCP_SERVER_SCRIPT = os.path.join(BASE_DIR, "mcp_db_server.py")
 DB_FILE = os.path.join(BASE_DIR, "solar_roi.sqlite")
 ASSUMPTIONS_MD = os.path.join(BASE_DIR, "roi-calculation-assumptions.md")
 
+REQUIRED_IMPORTS = (
+    ("mcp", "mcp"),
+    ("sqlparse", "sqlparse"),
+    ("google.adk", "google-adk"),
+)
+
+
+def verify_python_environment() -> list[str]:
+    """Return human-readable problems if this interpreter cannot run the MCP child process."""
+    problems: list[str] = []
+    for module, pip_name in REQUIRED_IMPORTS:
+        try:
+            __import__(module)
+        except ImportError:
+            problems.append(
+                f"Package `{pip_name}` is missing for interpreter:\n`{sys.executable}`"
+            )
+    if not os.path.isfile(MCP_SERVER_SCRIPT):
+        problems.append(f"MCP server script not found: `{MCP_SERVER_SCRIPT}`")
+    for folder, label in (
+        ("tnb-data", "TNB CSV history"),
+        ("solar-data", "October solar CSVs"),
+    ):
+        path = os.path.join(BASE_DIR, folder)
+        if not os.path.isdir(path):
+            problems.append(f"Missing data folder `{folder}/` ({label}).")
+    return problems
+
+
+def render_environment_errors(problems: list[str]) -> None:
+    st.error(
+        "**MCP database tools cannot start** — the child process "
+        f"`{sys.executable} mcp_db_server.py` would exit on import.\n\n"
+        "The chat message *“MCP SQL is disabled/unavailable”* is **not** from this app; "
+        "the model is guessing after a **failed tool call**."
+    )
+    for p in problems:
+        st.markdown(f"- {p}")
+    st.code(f"{sys.executable} -m pip install -r requirements.txt", language="bash")
+    st.caption("Use the **same** Python that runs `streamlit run app.py` (activate your venv first).")
+
+
+_ENV_PROBLEMS = verify_python_environment()
+if _ENV_PROBLEMS:
+    render_environment_errors(_ENV_PROBLEMS)
+    st.stop()
+
 # ==============================================================================
 # 2. Live Data Evolution Demo (November solar ingest while app runs)
 # ==============================================================================
+def ensure_solar_db_ready() -> None:
+    """Pre-build solar_roi.sqlite in the Streamlit process (same pattern as instant bank seed)."""
+    import mcp_db_server as srv
+
+    srv.DB_FILE = DB_FILE
+    if os.path.exists(DB_FILE):
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM import_metadata WHERE key = 'bootstrap_complete'"
+            ).fetchone()
+            if row:
+                return
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+    srv.ensure_database()
+
+
 def load_november_solar_into_db() -> tuple[bool, str]:
     """Ingest new-solar-data/ into SQLite (data_period 2026-11) for runtime discovery."""
     if not os.path.exists(DB_FILE):
@@ -123,7 +191,8 @@ def before_model_guardrail(callback_context, llm_request):
 # ==============================================================================
 # 4. Async True-MCP Turn Executor
 # ==============================================================================
-async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str]]:
+async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str]:
+    mcp_stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
     mcp_toolset = McpToolset(
         connection_params=StdioServerParameters(
             command=sys.executable,
@@ -136,7 +205,7 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str]]
             "summarize_solar_period",
             "read_query",
         ],
-        errlog=subprocess.DEVNULL,
+        errlog=mcp_stderr,
     )
 
     try:
@@ -200,9 +269,12 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str]]
                         reply_parts.append(part.text)
 
         final_text = "".join(reply_parts) if reply_parts else "No response generated."
-        return anonymize_text(final_text), tools_called
+        mcp_stderr.seek(0)
+        err_tail = mcp_stderr.read().strip()[-4000:]
+        return anonymize_text(final_text), tools_called, err_tail
     finally:
         await mcp_toolset.close()
+        mcp_stderr.close()
 
 
 # ==============================================================================
@@ -214,6 +286,7 @@ if "messages" not in st.session_state:
 with st.sidebar:
     st.title("☀️ Solar ROI MCP")
     st.caption("ADK `McpToolset` ↔ inverter + TNB SQLite")
+    st.caption(f"Python: `{sys.executable}`")
     st.markdown("---")
 
     st.subheader("⚡ Live data evolution")
@@ -288,14 +361,18 @@ if prompt_to_send:
         st.markdown(prompt_to_send)
 
     with st.chat_message("assistant"):
-        with st.spinner("Connecting to Solar MCP server (stdio)…"):
-            reply_text, tools_used = asyncio.run(
+        with st.spinner("Preparing database and MCP server…"):
+            ensure_solar_db_ready()
+            reply_text, tools_used, mcp_err = asyncio.run(
                 run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
             )
             if tools_used:
                 st.caption(
                     "🔌 **MCP calls:** " + " → ".join(f"`{t}`" for t in tools_used)
                 )
+            if mcp_err:
+                with st.expander("⚠️ MCP server stderr (tool may have failed)", expanded=True):
+                    st.code(mcp_err)
             st.markdown(reply_text)
             st.session_state.messages.append(
                 {"role": "assistant", "content": reply_text, "tools_used": tools_used}
