@@ -1,5 +1,6 @@
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -7,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 from google.adk.agents import Agent
 from google.adk.models import LlmResponse
@@ -188,10 +191,89 @@ def before_model_guardrail(callback_context, llm_request):
     return None
 
 
+def _function_call_args(raw) -> dict:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if hasattr(raw, "items"):
+        return dict(raw)
+    return {}
+
+
+def _payload_from_function_response(part) -> dict | None:
+    fr = getattr(part, "function_response", None)
+    if not fr:
+        return None
+    name = getattr(fr, "name", "") or ""
+    if name != "summarize_tnb_by_solar_period":
+        return None
+    raw = getattr(fr, "response", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(raw, dict):
+        if "stacked_bar_chart" in raw:
+            return raw
+        inner = raw.get("result") or raw.get("output")
+        if isinstance(inner, str):
+            try:
+                return json.loads(inner)
+            except json.JSONDecodeError:
+                return None
+        if isinstance(inner, dict):
+            return inner
+    return None
+
+
+def render_tnb_stacked_bar_chart(payload: dict) -> None:
+    chart_spec = payload.get("stacked_bar_chart")
+    if not chart_spec:
+        return
+    rows = chart_spec.get("rows") or []
+    order = chart_spec.get("series_order") or []
+    labels = chart_spec.get("series_labels") or {}
+    if not rows or not order:
+        return
+
+    df = pd.DataFrame(rows)
+    long_df = df.melt(id_vars=["day"], value_vars=order, var_name="period_key", value_name="kWh")
+    long_df["period"] = long_df["period_key"].map(labels).fillna(long_df["period_key"])
+    label_order = [labels.get(k, k) for k in order]
+
+    chart = (
+        alt.Chart(long_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("day:N", title="Day", sort=sorted(df["day"].unique().tolist())),
+            y=alt.Y("kWh:Q", title="Usage (kWh)", stack="zero"),
+            color=alt.Color(
+                "period:N",
+                title="Solar window",
+                sort=label_order,
+                scale=alt.Scale(scheme="tableau10"),
+            ),
+            tooltip=["day", "period", alt.Tooltip("kWh:Q", format=".2f")],
+        )
+        .properties(height=360, title=chart_spec.get("title", "TNB usage by solar daypart"))
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    avg = payload.get("average_daily_kwh_by_period") or {}
+    if avg:
+        cols = st.columns(4)
+        for col, key in zip(cols, order):
+            col.metric(labels.get(key, key), f"{avg.get(key, 0):.2f} kWh")
+
+
 # ==============================================================================
 # 4. Async True-MCP Turn Executor
 # ==============================================================================
-async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str]:
+async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str, dict | None]:
     mcp_stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
     mcp_toolset = McpToolset(
         connection_params=StdioServerParameters(
@@ -203,6 +285,7 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
             "list_datasets",
             "describe_table",
             "summarize_solar_period",
+            "summarize_tnb_by_solar_period",
             "read_query",
         ],
         errlog=mcp_stderr,
@@ -219,15 +302,18 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
             instruction=(
                 "You are **solar_roi_analyst**, an enterprise assistant for residential solar ROI in Malaysia (TNB / ATAP).\n\n"
                 "**Data via MCP (read-only SQL):**\n"
-                "- `tnb_usage` — pre-solar household import (30-min kWh); use view `v_tnb_usage_with_period` for "
-                "bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
+                "- **TNB load by daypart:** use `summarize_tnb_by_solar_period(from_date, to_date)` "
+                "(returns stacked_bar_chart JSON + average daily kWh per band). "
+                "Bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
                 "- **Solar inverter data:** always use `summarize_solar_period(data_period)` (e.g. `2026-10`, `2026-11`); "
                 "optional `from_date` / `to_date` (YYYY-MM-DD). Do **not** query table `solar_readings` via SQL.\n"
-                "- TNB: `tnb_usage` / view `v_tnb_usage_with_period` via `read_query` (aggregates preferred).\n"
+                "- Other TNB SQL only when needed: `read_query` on `v_tnb_usage_with_period` (aggregates, max 10 rows).\n"
                 "- `roi_assumptions` — rates and investment; `read_query` returns at most **10 rows** "
                 "(tool JSON includes `truncation_notice` when more rows matched).\n\n"
                 "**Workflow:** `list_datasets` when unsure what's loaded → `summarize_solar_period` for solar ROI → "
-                "`read_query` only for TNB patterns or assumptions. If `truncation_notice` is present, "
+                "`summarize_tnb_by_solar_period` for TNB daypart questions (e.g. last week of Aug 2026 → "
+                "`2026-08-25` … `2026-08-31`) → "
+                "`read_query` only for other TNB/assumption SQL. If `truncation_notice` is present, "
                 "tell the user results were truncated to 10 rows and how to refine. "
                 "Note seasonality limits when extrapolating.\n"
                 "Be concise and quantitative (kWh, RM, payback years)."
@@ -257,6 +343,8 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
         msg = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
         reply_parts = []
         tools_called = []
+        tnb_tool_args: dict = {}
+        tnb_chart_payload: dict | None = None
 
         async for event in runner.run_async(
             user_id="analyst", session_id=session_id, new_message=msg
@@ -264,14 +352,38 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
             if hasattr(event, "content") and event.content and event.content.parts:
                 for part in event.content.parts:
                     if getattr(part, "function_call", None):
-                        tools_called.append(part.function_call.name)
-                    elif getattr(part, "text", None):
+                        fc = part.function_call
+                        tools_called.append(fc.name)
+                        if fc.name == "summarize_tnb_by_solar_period":
+                            tnb_tool_args = _function_call_args(getattr(fc, "args", None))
+                    else:
+                        parsed = _payload_from_function_response(part)
+                        if parsed and parsed.get("stacked_bar_chart"):
+                            tnb_chart_payload = parsed
+                    if getattr(part, "text", None):
                         reply_parts.append(part.text)
+
+        if (
+            tnb_chart_payload is None
+            and "summarize_tnb_by_solar_period" in tools_called
+            and tnb_tool_args.get("from_date")
+            and tnb_tool_args.get("to_date")
+        ):
+            import mcp_db_server as srv
+
+            srv.DB_FILE = DB_FILE
+            raw = srv.summarize_tnb_by_solar_period(
+                tnb_tool_args["from_date"],
+                tnb_tool_args["to_date"],
+            )
+            parsed = json.loads(raw)
+            if parsed.get("status") == "success":
+                tnb_chart_payload = parsed
 
         final_text = "".join(reply_parts) if reply_parts else "No response generated."
         mcp_stderr.seek(0)
         err_tail = mcp_stderr.read().strip()[-4000:]
-        return anonymize_text(final_text), tools_called, err_tail
+        return anonymize_text(final_text), tools_called, err_tail, tnb_chart_payload
     finally:
         await mcp_toolset.close()
         mcp_stderr.close()
@@ -343,6 +455,8 @@ for msg in st.session_state.messages:
                 "🔌 **MCP calls:** " + " → ".join(f"`{t}`" for t in msg["tools_used"])
             )
         st.markdown(msg["content"])
+        if msg.get("tnb_chart"):
+            render_tnb_stacked_bar_chart(msg["tnb_chart"])
 
 prompt_to_send = None
 if st.session_state.get("pending_prompt"):
@@ -363,7 +477,7 @@ if prompt_to_send:
     with st.chat_message("assistant"):
         with st.spinner("Preparing database and MCP server…"):
             ensure_solar_db_ready()
-            reply_text, tools_used, mcp_err = asyncio.run(
+            reply_text, tools_used, mcp_err, tnb_chart = asyncio.run(
                 run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
             )
             if tools_used:
@@ -373,7 +487,14 @@ if prompt_to_send:
             if mcp_err:
                 with st.expander("⚠️ MCP server stderr (tool may have failed)", expanded=True):
                     st.code(mcp_err)
+            if tnb_chart:
+                render_tnb_stacked_bar_chart(tnb_chart)
             st.markdown(reply_text)
             st.session_state.messages.append(
-                {"role": "assistant", "content": reply_text, "tools_used": tools_used}
+                {
+                    "role": "assistant",
+                    "content": reply_text,
+                    "tools_used": tools_used,
+                    "tnb_chart": tnb_chart,
+                }
             )

@@ -249,6 +249,20 @@ READ_QUERY_ROW_CAP = 10
 
 SOLAR_RAW_BLOCKLIST = ("solar_readings", "v_solar_interval_kwh")
 
+TNB_SOLAR_PERIOD_ORDER = (
+    "partial_solar_am",
+    "peak_solar",
+    "partial_solar_pm",
+    "no_solar",
+)
+
+TNB_SOLAR_PERIOD_LABELS = {
+    "partial_solar_am": "Partial solar AM (07–10)",
+    "peak_solar": "Peak solar (10–16)",
+    "partial_solar_pm": "Partial solar PM (16–19)",
+    "no_solar": "No solar (19–07)",
+}
+
 
 def is_sql_mutation(sql_query: str) -> bool:
     cleaned = sql_query.strip().strip(";")
@@ -350,6 +364,82 @@ def list_datasets() -> str:
                 "peak_solar": "10:00–16:00",
                 "partial_solar_pm": "16:00–19:00",
                 "no_solar": "19:00–07:00",
+            },
+            "tnb_summary_tool": "summarize_tnb_by_solar_period",
+        }
+    )
+
+
+@mcp.tool()
+def summarize_tnb_by_solar_period(from_date: str, to_date: str) -> str:
+    """
+    Average daily TNB import (kWh) by solar daypart between from_date and to_date (YYYY-MM-DD, inclusive).
+    Returns compact totals plus stacked_bar_chart rows for UI (one bar per day, stacks = AM/peak/PM/no solar).
+    """
+    ensure_database()
+    start = from_date.strip()
+    end = to_date.strip()
+    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            date(reading_datetime) AS day,
+            solar_period,
+            ROUND(SUM(usage_kwh), 3) AS usage_kwh
+        FROM v_tnb_usage_with_period
+        WHERE date(reading_datetime) >= ? AND date(reading_datetime) <= ?
+        GROUP BY day, solar_period
+        ORDER BY day, solar_period
+        """,
+        (start, end),
+    )
+    raw = cur.fetchall()
+    conn.close()
+
+    if not raw:
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"No TNB readings between {start} and {end}.",
+            }
+        )
+
+    by_day: dict[str, dict[str, float]] = {}
+    for day, period, kwh in raw:
+        by_day.setdefault(day, {p: 0.0 for p in TNB_SOLAR_PERIOD_ORDER})
+        if period in by_day[day]:
+            by_day[day][period] = float(kwh)
+
+    daily_rows = []
+    for day in sorted(by_day):
+        row = {"day": day}
+        for p in TNB_SOLAR_PERIOD_ORDER:
+            row[p] = by_day[day][p]
+        row["total_kwh"] = round(sum(by_day[day][p] for p in TNB_SOLAR_PERIOD_ORDER), 3)
+        daily_rows.append(row)
+
+    days_count = len(daily_rows)
+    averages = {
+        p: round(sum(r[p] for r in daily_rows) / days_count, 3) for p in TNB_SOLAR_PERIOD_ORDER
+    }
+    averages["total_kwh"] = round(sum(r["total_kwh"] for r in daily_rows) / days_count, 3)
+
+    return json.dumps(
+        {
+            "status": "success",
+            "from_date": start,
+            "to_date": end,
+            "days_count": days_count,
+            "daily_kwh_by_period": daily_rows,
+            "average_daily_kwh_by_period": averages,
+            "period_labels": TNB_SOLAR_PERIOD_LABELS,
+            "stacked_bar_chart": {
+                "title": f"TNB usage (kWh) by solar daypart — {start} to {end}",
+                "x_field": "day",
+                "series_order": list(TNB_SOLAR_PERIOD_ORDER),
+                "series_labels": TNB_SOLAR_PERIOD_LABELS,
+                "rows": daily_rows,
             },
         }
     )
