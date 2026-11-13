@@ -1096,8 +1096,11 @@ def compare_solar_periods(
                 "x_title": "Calendar day",
                 "aggregation": "calendar_day",
                 "y_field": "kwh",
-                "series_field": "data_period",
-                "stroke_field": "flow",
+                "color_field": "flow",
+                "dash_field": "data_period",
+                "flow_order": list(SOLAR_DAILY_FLOW_ORDER),
+                "flow_labels": SOLAR_DAILY_FLOW_LABELS,
+                "period_order": [period_a, period_b],
                 "rows": line_rows,
             },
             "grouped_period_average_chart": {

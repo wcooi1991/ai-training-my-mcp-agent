@@ -539,16 +539,43 @@ def render_solar_compare_chart(payload: dict) -> None:
     if spec and spec.get("rows"):
         line_df = pd.DataFrame(spec["rows"])
         y_field = spec.get("y_field", "kwh")
-        stroke_field = spec.get("stroke_field", "flow")
+        flow_field = spec.get("color_field", "flow")
+        period_field = spec.get("dash_field", "data_period")
+        flow_labels = spec.get("flow_labels") or {}
+        flow_order = spec.get("flow_order") or []
+        flow_sort = [flow_labels.get(k, k) for k in flow_order] or sorted(
+            line_df[flow_field].unique().tolist()
+        )
+        period_order = spec.get("period_order") or sorted(
+            line_df[period_field].unique().tolist()
+        )
+        dash_patterns = [[1, 0], [6, 3], [4, 2], [2, 2], [8, 4], [1, 2]]
+        period_dash = dash_patterns[: max(len(period_order), 1)]
         chart = (
             alt.Chart(line_df)
             .mark_line(point=True)
             .encode(
-                x=alt.X("day:T", title="Day"),
+                x=alt.X("day:T", title=spec.get("x_title", "Calendar day")),
                 y=alt.Y(f"{y_field}:Q", title="kWh"),
-                color=alt.Color("data_period:N", title="Period"),
-                strokeDash=alt.StrokeDash(f"{stroke_field}:N", title="Flow"),
-                tooltip=["day", "data_period", stroke_field, alt.Tooltip(f"{y_field}:Q", format=".2f")],
+                color=alt.Color(
+                    f"{flow_field}:N",
+                    title="Flow",
+                    sort=flow_sort,
+                    legend=alt.Legend(orient="bottom", titleAnchor="start"),
+                ),
+                strokeDash=alt.StrokeDash(
+                    f"{period_field}:N",
+                    title="Period",
+                    sort=period_order,
+                    scale=alt.Scale(domain=period_order, range=period_dash),
+                    legend=alt.Legend(orient="bottom", titleAnchor="start"),
+                ),
+                tooltip=[
+                    "day",
+                    period_field,
+                    flow_field,
+                    alt.Tooltip(f"{y_field}:Q", format=".2f"),
+                ],
             )
             .properties(height=380, title=spec.get("title", "Period comparison"))
         )
