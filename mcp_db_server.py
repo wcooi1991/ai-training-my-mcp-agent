@@ -69,9 +69,15 @@ GROUP BY data_period, date(reading_time);
 """
 
 
-def _parse_tnb_datetime(raw: str) -> str:
-    """DD-MM-YYYY HH:MM -> ISO local timestamp for SQLite."""
-    dt = datetime.strptime(raw.strip(), "%d-%m-%Y %H:%M")
+def _parse_tnb_datetime(raw: str) -> str | None:
+    """DD-MM-YYYY HH:MM -> ISO local timestamp for SQLite; None if not a reading row."""
+    text = (raw or "").strip()
+    if not text or text.lower() == "total":
+        return None
+    try:
+        dt = datetime.strptime(text, "%d-%m-%Y %H:%M")
+    except ValueError:
+        return None
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -156,6 +162,8 @@ def import_tnb_csvs(conn: sqlite3.Connection) -> int:
                 except (TypeError, ValueError):
                     continue
                 dt_iso = _parse_tnb_datetime(row[date_key])
+                if not dt_iso:
+                    continue
                 conn.execute(
                     """
                     INSERT INTO tnb_usage (reading_datetime, usage_kwh, source_file_date)
