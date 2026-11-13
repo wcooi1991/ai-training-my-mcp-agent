@@ -245,13 +245,16 @@ def render_tnb_stacked_bar_chart(payload: dict) -> None:
     long_df = df.melt(id_vars=["day"], value_vars=order, var_name="period_key", value_name="kWh")
     long_df["period"] = long_df["period_key"].map(labels).fillna(long_df["period_key"])
     label_order = [labels.get(k, k) for k in order]
+    x_sort = chart_spec.get("x_sort") or sorted(df["day"].unique().tolist())
+    x_title = chart_spec.get("x_title", "Day")
+    y_title = "Avg usage (kWh)" if chart_spec.get("aggregation") == "weekday_average" else "Usage (kWh)"
 
     chart = (
         alt.Chart(long_df)
         .mark_bar()
         .encode(
-            x=alt.X("day:N", title="Day", sort=sorted(df["day"].unique().tolist())),
-            y=alt.Y("kWh:Q", title="Usage (kWh)", stack="zero"),
+            x=alt.X("day:N", title=x_title, sort=x_sort),
+            y=alt.Y("kWh:Q", title=y_title, stack="zero"),
             color=alt.Color(
                 "period:N",
                 title="Solar window",
@@ -402,7 +405,7 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "You are **solar_roi_analyst**, an enterprise assistant for residential solar ROI in Malaysia (TNB / ATAP).\n\n"
                 "**Data via MCP (read-only SQL):**\n"
                 "- **TNB load by daypart:** use `summarize_tnb_by_solar_period(from_date, to_date)` "
-                "(returns stacked_bar_chart JSON + average daily kWh per band). "
+                "(stacked_bar_chart = **weekday average** Mon–Sun; daily detail in JSON). "
                 "Bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
                 "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: grouped daily flows + "
                 "production line). For **Oct vs Nov** (or any two periods), use `compare_solar_periods(a, b)` "

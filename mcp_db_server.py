@@ -263,6 +263,16 @@ TNB_SOLAR_PERIOD_LABELS = {
     "no_solar": "No solar (19–07)",
 }
 
+WEEKDAY_ORDER = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
 SOLAR_DAILY_FLOW_ORDER = (
     "production_kwh",
     "import_kwh",
@@ -388,8 +398,8 @@ def list_datasets() -> str:
 @mcp.tool()
 def summarize_tnb_by_solar_period(from_date: str, to_date: str) -> str:
     """
-    Average daily TNB import (kWh) by solar daypart between from_date and to_date (YYYY-MM-DD, inclusive).
-    Returns compact totals plus stacked_bar_chart rows for UI (one bar per day, stacks = AM/peak/PM/no solar).
+    TNB import (kWh) by solar daypart between from_date and to_date (YYYY-MM-DD, inclusive).
+    Returns daily detail plus stacked_bar_chart averaged by day-of-week (Mon–Sun) for the UI.
     """
     ensure_database()
     start = from_date.strip()
@@ -440,6 +450,25 @@ def summarize_tnb_by_solar_period(from_date: str, to_date: str) -> str:
     }
     averages["total_kwh"] = round(sum(r["total_kwh"] for r in daily_rows) / days_count, 3)
 
+    by_weekday: dict[str, list[dict[str, float]]] = {w: [] for w in WEEKDAY_ORDER}
+    for day in sorted(by_day):
+        weekday = WEEKDAY_ORDER[datetime.strptime(day, "%Y-%m-%d").weekday()]
+        by_weekday[weekday].append(by_day[day])
+
+    weekday_chart_rows = []
+    for weekday in WEEKDAY_ORDER:
+        samples = by_weekday[weekday]
+        row = {"day": weekday, "weekday": weekday, "sample_days": len(samples)}
+        if not samples:
+            for p in TNB_SOLAR_PERIOD_ORDER:
+                row[p] = 0.0
+        else:
+            n = len(samples)
+            for p in TNB_SOLAR_PERIOD_ORDER:
+                row[p] = round(sum(s[p] for s in samples) / n, 3)
+        row["total_kwh"] = round(sum(row[p] for p in TNB_SOLAR_PERIOD_ORDER), 3)
+        weekday_chart_rows.append(row)
+
     return json.dumps(
         {
             "status": "success",
@@ -448,13 +477,17 @@ def summarize_tnb_by_solar_period(from_date: str, to_date: str) -> str:
             "days_count": days_count,
             "daily_kwh_by_period": daily_rows,
             "average_daily_kwh_by_period": averages,
+            "average_kwh_by_weekday_and_period": weekday_chart_rows,
             "period_labels": TNB_SOLAR_PERIOD_LABELS,
             "stacked_bar_chart": {
-                "title": f"TNB usage (kWh) by solar daypart — {start} to {end}",
+                "title": f"Average TNB usage by weekday & solar daypart ({start} to {end})",
                 "x_field": "day",
+                "x_title": "Day of week",
+                "x_sort": list(WEEKDAY_ORDER),
+                "aggregation": "weekday_average",
                 "series_order": list(TNB_SOLAR_PERIOD_ORDER),
                 "series_labels": TNB_SOLAR_PERIOD_LABELS,
-                "rows": daily_rows,
+                "rows": weekday_chart_rows,
             },
         }
     )
