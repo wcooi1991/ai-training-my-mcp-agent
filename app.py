@@ -191,6 +191,84 @@ def before_model_guardrail(callback_context, llm_request):
     return None
 
 
+def _zero_token_usage() -> dict:
+    return {"prompt": 0, "output": 0, "total": 0, "llm_calls": 0}
+
+
+def _coerce_usage_metadata(um) -> dict | None:
+    if um is None:
+        return None
+    if isinstance(um, dict):
+        prompt = um.get("prompt_token_count") or um.get("promptTokenCount") or 0
+        output = um.get("candidates_token_count") or um.get("candidatesTokenCount") or 0
+        total = um.get("total_token_count") or um.get("totalTokenCount") or 0
+    else:
+        prompt = getattr(um, "prompt_token_count", 0) or 0
+        output = getattr(um, "candidates_token_count", 0) or 0
+        total = getattr(um, "total_token_count", 0) or 0
+    prompt, output, total = int(prompt), int(output), int(total)
+    if total == 0 and (prompt or output):
+        total = prompt + output
+    if not (prompt or output or total):
+        return None
+    return {"prompt": prompt, "output": output, "total": total}
+
+
+def _usage_from_event(event) -> dict | None:
+    """Best-effort token counts from ADK / Gemini runner events."""
+    metas = []
+    direct = getattr(event, "usage_metadata", None)
+    if direct is not None:
+        metas.append(direct)
+    content = getattr(event, "content", None)
+    if content is not None:
+        metas.append(getattr(content, "usage_metadata", None))
+    if hasattr(event, "model_dump"):
+        try:
+            dumped = event.model_dump(exclude_none=True)
+            if dumped.get("usage_metadata"):
+                metas.append(dumped["usage_metadata"])
+            inner = dumped.get("content") or {}
+            if isinstance(inner, dict) and inner.get("usage_metadata"):
+                metas.append(inner["usage_metadata"])
+        except Exception:
+            pass
+    for um in metas:
+        parsed = _coerce_usage_metadata(um)
+        if parsed:
+            return parsed
+    return None
+
+
+def _merge_token_usage(base: dict, delta: dict) -> dict:
+    return {
+        "prompt": base.get("prompt", 0) + delta.get("prompt", 0),
+        "output": base.get("output", 0) + delta.get("output", 0),
+        "total": base.get("total", 0) + delta.get("total", 0),
+        "llm_calls": base.get("llm_calls", 0) + delta.get("llm_calls", 0),
+    }
+
+
+def render_sidebar_token_usage() -> None:
+    st.markdown("---")
+    st.caption("**Token usage**")
+    session = st.session_state.get("token_usage") or _zero_token_usage()
+    last = st.session_state.get("last_turn_tokens")
+    c1, c2 = st.columns(2)
+    c1.metric("Session total", f"{session.get('total', 0):,}")
+    c2.metric("Session in", f"{session.get('prompt', 0):,}")
+    c3, c4 = st.columns(2)
+    c3.metric("Session out", f"{session.get('output', 0):,}")
+    c4.metric("LLM calls", f"{session.get('llm_calls', 0):,}")
+    if last and last.get("total"):
+        st.caption(
+            f"Last turn: **{last['total']:,}** total "
+            f"({last.get('prompt', 0):,} in / {last.get('output', 0):,} out)"
+        )
+    else:
+        st.caption("Last turn: —")
+
+
 def _function_call_args(raw) -> dict:
     if raw is None:
         return {}
@@ -374,7 +452,7 @@ def _store_chart_payload(charts: dict, tool_name: str, payload: dict) -> None:
 # ==============================================================================
 # 4. Async True-MCP Turn Executor
 # ==============================================================================
-async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str, dict]:
+async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str, dict, dict]:
     mcp_stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
     mcp_toolset = McpToolset(
         connection_params=StdioServerParameters(
@@ -448,10 +526,16 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
         tools_called = []
         tool_args: dict[str, dict] = {}
         charts: dict = {"tnb": None, "solar": None, "compare": None}
+        turn_usage = _zero_token_usage()
 
         async for event in runner.run_async(
             user_id="analyst", session_id=session_id, new_message=msg
         ):
+            usage_delta = _usage_from_event(event)
+            if usage_delta:
+                turn_usage = _merge_token_usage(
+                    turn_usage, {**usage_delta, "llm_calls": 1}
+                )
             if hasattr(event, "content") and event.content and event.content.parts:
                 for part in event.content.parts:
                     if getattr(part, "function_call", None):
@@ -509,7 +593,7 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
         mcp_stderr.seek(0)
         err_tail = mcp_stderr.read().strip()[-4000:]
         bundle = {k: v for k, v in charts.items() if v is not None}
-        return anonymize_text(final_text), tools_called, err_tail, bundle
+        return anonymize_text(final_text), tools_called, err_tail, bundle, turn_usage
     finally:
         await mcp_toolset.close()
         mcp_stderr.close()
@@ -520,6 +604,10 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
 # ==============================================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "token_usage" not in st.session_state:
+    st.session_state.token_usage = _zero_token_usage()
+if "last_turn_tokens" not in st.session_state:
+    st.session_state.last_turn_tokens = None
 
 with st.sidebar:
     st.title("☀️ Solar ROI MCP")
@@ -558,6 +646,8 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🗑️ Clear chat history", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.token_usage = _zero_token_usage()
+        st.session_state.last_turn_tokens = None
         st.rerun()
 
     st.markdown("---")
@@ -605,9 +695,16 @@ if prompt_to_send:
     with st.chat_message("assistant"):
         with st.spinner("Preparing database and MCP server…"):
             ensure_solar_db_ready()
-            reply_text, tools_used, mcp_err, charts = asyncio.run(
+            reply_text, tools_used, mcp_err, charts, turn_usage = asyncio.run(
                 run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
             )
+            if turn_usage.get("total") or turn_usage.get("prompt") or turn_usage.get("output"):
+                st.session_state.last_turn_tokens = turn_usage
+                st.session_state.token_usage = _merge_token_usage(
+                    st.session_state.token_usage, turn_usage
+                )
+            else:
+                st.session_state.last_turn_tokens = None
             if tools_used:
                 st.caption(
                     "🔌 **MCP calls:** " + " → ".join(f"`{t}`" for t in tools_used)
@@ -625,3 +722,6 @@ if prompt_to_send:
                     "charts": charts,
                 }
             )
+
+with st.sidebar:
+    render_sidebar_token_usage()
