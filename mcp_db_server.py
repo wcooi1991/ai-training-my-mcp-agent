@@ -263,6 +263,20 @@ TNB_SOLAR_PERIOD_LABELS = {
     "no_solar": "No solar (19–07)",
 }
 
+SOLAR_DAILY_FLOW_ORDER = (
+    "production_kwh",
+    "import_kwh",
+    "export_kwh",
+    "self_consumed_kwh",
+)
+
+SOLAR_DAILY_FLOW_LABELS = {
+    "production_kwh": "Production",
+    "import_kwh": "Grid import",
+    "export_kwh": "Grid export",
+    "self_consumed_kwh": "Self-consumed",
+}
+
 
 def is_sql_mutation(sql_query: str) -> bool:
     cleaned = sql_query.strip().strip(";")
@@ -366,6 +380,7 @@ def list_datasets() -> str:
                 "no_solar": "19:00–07:00",
             },
             "tnb_summary_tool": "summarize_tnb_by_solar_period",
+            "solar_compare_tool": "compare_solar_periods",
         }
     )
 
@@ -470,40 +485,12 @@ def describe_table(table_name: str) -> str:
     return json.dumps({"status": "success", "object": cleaned, "kind": meta[0], "columns": cols})
 
 
-@mcp.tool()
-def summarize_solar_period(
-    data_period: str,
+def _fetch_solar_daily_rollup(
+    conn: sqlite3.Connection,
+    period: str,
     from_date: str | None = None,
     to_date: str | None = None,
-) -> str:
-    """
-    Compact solar/inverter summary for a data_period (e.g. 2026-10, 2026-11).
-    Returns period totals, daily kWh rollup (one row per day), generation by daypart,
-    and estimated RM savings using roi_assumptions rates. Does not return 5-min rows.
-    Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive.
-    """
-    ensure_database()
-    period = data_period.strip()
-    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT COUNT(*) FROM solar_readings
-        WHERE data_period = ?
-        """,
-        (period,),
-    )
-    if cur.fetchone()[0] == 0:
-        conn.close()
-        return json.dumps(
-            {
-                "status": "error",
-                "message": f"No solar_readings for data_period '{period}'. "
-                "Call list_datasets; load November via app if needed.",
-            }
-        )
-
+) -> list[dict]:
     daily_sql = """
         SELECT day, production_kwh, import_kwh, export_kwh, self_consumed_kwh
         FROM v_solar_daily_totals
@@ -518,8 +505,60 @@ def summarize_solar_period(
         params.append(to_date.strip())
     daily_sql += " ORDER BY day"
 
+    cur = conn.cursor()
     cur.execute(daily_sql, params)
-    daily_rows = cur.fetchall()
+    return [
+        {
+            "day": r[0],
+            "production_kwh": r[1],
+            "import_kwh": r[2],
+            "export_kwh": r[3],
+            "self_consumed_kwh": r[4],
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def _solar_period_has_data(conn: sqlite3.Connection, period: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM solar_readings WHERE data_period = ?",
+        (period,),
+    )
+    return cur.fetchone()[0] > 0
+
+
+@mcp.tool()
+def summarize_solar_period(
+    data_period: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> str:
+    """
+    Compact solar/inverter summary for a data_period (e.g. 2026-10, 2026-11).
+    Returns period totals, daily kWh rollup, generation by daypart, RM savings, and
+    grouped_bar_chart + line_production_trend chart specs for the UI.
+    Optional from_date / to_date: ISO dates YYYY-MM-DD inclusive.
+    """
+    ensure_database()
+    period = data_period.strip()
+    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
+
+    if not _solar_period_has_data(conn, period):
+        conn.close()
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"No solar_readings for data_period '{period}'. "
+                "Call list_datasets; load November via app if needed.",
+            }
+        )
+
+    daily = _fetch_solar_daily_rollup(conn, period, from_date, to_date)
+    daily_rows = [
+        (d["day"], d["production_kwh"], d["import_kwh"], d["export_kwh"], d["self_consumed_kwh"])
+        for d in daily
+    ]
 
     totals = {
         "production_kwh": round(sum(r[1] for r in daily_rows), 2),
@@ -553,6 +592,7 @@ def summarize_solar_period(
         band_params.append(to_date.strip())
     band_sql += " GROUP BY band ORDER BY band"
 
+    cur = conn.cursor()
     cur.execute(band_sql, band_params)
     production_by_daypart = {r[0]: r[1] for r in cur.fetchall()}
 
@@ -571,17 +611,6 @@ def summarize_solar_period(
 
     conn.close()
 
-    daily = [
-        {
-            "day": r[0],
-            "production_kwh": r[1],
-            "import_kwh": r[2],
-            "export_kwh": r[3],
-            "self_consumed_kwh": r[4],
-        }
-        for r in daily_rows
-    ]
-
     return json.dumps(
         {
             "status": "success",
@@ -599,6 +628,104 @@ def summarize_solar_period(
             "rates_used_rm_per_kwh": {
                 "import_avoided": rates.get("import_avoided_rm_per_kwh"),
                 "export_credit": rates.get("export_credit_atap_rm_per_kwh"),
+            },
+            "grouped_bar_chart": {
+                "title": f"Daily energy flows (kWh) — {period}",
+                "x_field": "day",
+                "series_order": list(SOLAR_DAILY_FLOW_ORDER),
+                "series_labels": SOLAR_DAILY_FLOW_LABELS,
+                "rows": daily,
+            },
+            "line_production_trend": {
+                "title": f"Daily production trend (kWh) — {period}",
+                "x_field": "day",
+                "y_field": "production_kwh",
+                "rows": [{"day": d["day"], "production_kwh": d["production_kwh"]} for d in daily],
+            },
+        }
+    )
+
+
+@mcp.tool()
+def compare_solar_periods(
+    data_period_a: str,
+    data_period_b: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> str:
+    """
+    Compare daily solar production between two data_period values (e.g. 2026-10 vs 2026-11).
+    Returns totals side-by-side and dual_line_chart rows for overlaid production trends.
+    Optional from_date / to_date filter applied to both periods.
+    """
+    ensure_database()
+    period_a = data_period_a.strip()
+    period_b = data_period_b.strip()
+    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
+
+    missing = [
+        p for p in (period_a, period_b) if not _solar_period_has_data(conn, p)
+    ]
+    if missing:
+        conn.close()
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"No solar data for period(s): {', '.join(missing)}. "
+                "Use list_datasets; load November from the app if needed.",
+            }
+        )
+
+    daily_a = _fetch_solar_daily_rollup(conn, period_a, from_date, to_date)
+    daily_b = _fetch_solar_daily_rollup(conn, period_b, from_date, to_date)
+    conn.close()
+
+    def _sum_metric(rows: list[dict], key: str) -> float:
+        return round(sum(float(r[key]) for r in rows), 2)
+
+    line_rows = []
+    for row in daily_a:
+        line_rows.append(
+            {
+                "day": row["day"],
+                "data_period": period_a,
+                "production_kwh": row["production_kwh"],
+            }
+        )
+    for row in daily_b:
+        line_rows.append(
+            {
+                "day": row["day"],
+                "data_period": period_b,
+                "production_kwh": row["production_kwh"],
+            }
+        )
+
+    return json.dumps(
+        {
+            "status": "success",
+            "data_period_a": period_a,
+            "data_period_b": period_b,
+            "from_date": from_date,
+            "to_date": to_date,
+            "period_a_totals": {
+                "days": len(daily_a),
+                "production_kwh": _sum_metric(daily_a, "production_kwh"),
+                "export_kwh": _sum_metric(daily_a, "export_kwh"),
+                "self_consumed_kwh": _sum_metric(daily_a, "self_consumed_kwh"),
+            },
+            "period_b_totals": {
+                "days": len(daily_b),
+                "production_kwh": _sum_metric(daily_b, "production_kwh"),
+                "export_kwh": _sum_metric(daily_b, "export_kwh"),
+                "self_consumed_kwh": _sum_metric(daily_b, "self_consumed_kwh"),
+            },
+            "dual_line_chart": {
+                "title": f"Daily production — {period_a} vs {period_b}",
+                "x_field": "day",
+                "y_field": "production_kwh",
+                "series_field": "data_period",
+                "rows": line_rows,
             },
         }
     )

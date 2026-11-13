@@ -201,14 +201,7 @@ def _function_call_args(raw) -> dict:
     return {}
 
 
-def _payload_from_function_response(part) -> dict | None:
-    fr = getattr(part, "function_response", None)
-    if not fr:
-        return None
-    name = getattr(fr, "name", "") or ""
-    if name != "summarize_tnb_by_solar_period":
-        return None
-    raw = getattr(fr, "response", None)
+def _decode_tool_response(raw) -> dict | None:
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -217,17 +210,25 @@ def _payload_from_function_response(part) -> dict | None:
         except json.JSONDecodeError:
             return None
     if isinstance(raw, dict):
-        if "stacked_bar_chart" in raw:
+        if raw.get("status"):
             return raw
         inner = raw.get("result") or raw.get("output")
         if isinstance(inner, str):
-            try:
-                return json.loads(inner)
-            except json.JSONDecodeError:
-                return None
+            return _decode_tool_response(inner)
         if isinstance(inner, dict):
             return inner
     return None
+
+
+def _payload_from_function_response(part) -> tuple[str, dict] | None:
+    fr = getattr(part, "function_response", None)
+    if not fr:
+        return None
+    name = getattr(fr, "name", "") or ""
+    payload = _decode_tool_response(getattr(fr, "response", None))
+    if not payload or payload.get("status") != "success":
+        return None
+    return name, payload
 
 
 def render_tnb_stacked_bar_chart(payload: dict) -> None:
@@ -270,10 +271,107 @@ def render_tnb_stacked_bar_chart(payload: dict) -> None:
             col.metric(labels.get(key, key), f"{avg.get(key, 0):.2f} kWh")
 
 
+def render_solar_summary_charts(payload: dict) -> None:
+    grouped = payload.get("grouped_bar_chart")
+    if grouped and grouped.get("rows"):
+        df = pd.DataFrame(grouped["rows"])
+        order = grouped.get("series_order") or []
+        labels = grouped.get("series_labels") or {}
+        long_df = df.melt(id_vars=["day"], value_vars=order, var_name="series_key", value_name="kWh")
+        long_df["series"] = long_df["series_key"].map(labels).fillna(long_df["series_key"])
+        label_order = [labels.get(k, k) for k in order]
+        bar = (
+            alt.Chart(long_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("day:N", title="Day", sort=sorted(df["day"].unique().tolist())),
+                y=alt.Y("kWh:Q", title="kWh"),
+                color=alt.Color("series:N", sort=label_order, title="Flow"),
+                xOffset=alt.XOffset("series:N", sort=label_order),
+                tooltip=["day", "series", alt.Tooltip("kWh:Q", format=".2f")],
+            )
+            .properties(height=340, title=grouped.get("title", "Daily solar flows"))
+        )
+        st.altair_chart(bar, use_container_width=True)
+
+    line_spec = payload.get("line_production_trend")
+    if line_spec and line_spec.get("rows"):
+        line_df = pd.DataFrame(line_spec["rows"])
+        line = (
+            alt.Chart(line_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("day:T", title="Day"),
+                y=alt.Y("production_kwh:Q", title="Production (kWh)"),
+                tooltip=["day", alt.Tooltip("production_kwh:Q", format=".2f")],
+            )
+            .properties(height=280, title=line_spec.get("title", "Production trend"))
+        )
+        st.altair_chart(line, use_container_width=True)
+
+    totals = payload.get("totals") or {}
+    if totals:
+        cols = st.columns(4)
+        cols[0].metric("Production", f"{totals.get('production_kwh', 0):.1f} kWh")
+        cols[1].metric("Import", f"{totals.get('import_kwh', 0):.1f} kWh")
+        cols[2].metric("Export", f"{totals.get('export_kwh', 0):.1f} kWh")
+        cols[3].metric("Self-consumed", f"{totals.get('self_consumed_kwh', 0):.1f} kWh")
+
+
+def render_solar_compare_chart(payload: dict) -> None:
+    spec = payload.get("dual_line_chart")
+    if not spec or not spec.get("rows"):
+        return
+    line_df = pd.DataFrame(spec["rows"])
+    chart = (
+        alt.Chart(line_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("day:T", title="Day"),
+            y=alt.Y("production_kwh:Q", title="Production (kWh)"),
+            color=alt.Color("data_period:N", title="Period"),
+            tooltip=["day", "data_period", alt.Tooltip("production_kwh:Q", format=".2f")],
+        )
+        .properties(height=360, title=spec.get("title", "Production comparison"))
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    a = payload.get("period_a_totals") or {}
+    b = payload.get("period_b_totals") or {}
+    if a and b:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**{payload.get('data_period_a', 'A')}**")
+            st.metric("Total production", f"{a.get('production_kwh', 0):.1f} kWh")
+        with c2:
+            st.markdown(f"**{payload.get('data_period_b', 'B')}**")
+            st.metric("Total production", f"{b.get('production_kwh', 0):.1f} kWh")
+
+
+def render_chart_bundle(bundle: dict | None) -> None:
+    if not bundle:
+        return
+    if bundle.get("tnb"):
+        render_tnb_stacked_bar_chart(bundle["tnb"])
+    if bundle.get("solar"):
+        render_solar_summary_charts(bundle["solar"])
+    if bundle.get("compare"):
+        render_solar_compare_chart(bundle["compare"])
+
+
+def _store_chart_payload(charts: dict, tool_name: str, payload: dict) -> None:
+    if tool_name == "summarize_tnb_by_solar_period":
+        charts["tnb"] = payload
+    elif tool_name == "summarize_solar_period":
+        charts["solar"] = payload
+    elif tool_name == "compare_solar_periods":
+        charts["compare"] = payload
+
+
 # ==============================================================================
 # 4. Async True-MCP Turn Executor
 # ==============================================================================
-async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str, dict | None]:
+async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str], str, dict]:
     mcp_stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
     mcp_toolset = McpToolset(
         connection_params=StdioServerParameters(
@@ -286,6 +384,7 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
             "describe_table",
             "summarize_solar_period",
             "summarize_tnb_by_solar_period",
+            "compare_solar_periods",
             "read_query",
         ],
         errlog=mcp_stderr,
@@ -305,8 +404,9 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                 "- **TNB load by daypart:** use `summarize_tnb_by_solar_period(from_date, to_date)` "
                 "(returns stacked_bar_chart JSON + average daily kWh per band). "
                 "Bands: partial_solar_am (07–10), peak_solar (10–16), partial_solar_pm (16–19), no_solar (19–07).\n"
-                "- **Solar inverter data:** always use `summarize_solar_period(data_period)` (e.g. `2026-10`, `2026-11`); "
-                "optional `from_date` / `to_date` (YYYY-MM-DD). Do **not** query table `solar_readings` via SQL.\n"
+                "- **Solar inverter data:** use `summarize_solar_period(data_period)` (charts: grouped daily flows + "
+                "production line). For **Oct vs Nov** (or any two periods), use `compare_solar_periods(a, b)` "
+                "dual production line — not two separate summarizes. Do **not** query `solar_readings` via SQL.\n"
                 "- Other TNB SQL only when needed: `read_query` on `v_tnb_usage_with_period` (aggregates, max 10 rows).\n"
                 "- `roi_assumptions` — rates and investment; `read_query` returns at most **10 rows** "
                 "(tool JSON includes `truncation_notice` when more rows matched).\n\n"
@@ -343,8 +443,8 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
         msg = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
         reply_parts = []
         tools_called = []
-        tnb_tool_args: dict = {}
-        tnb_chart_payload: dict | None = None
+        tool_args: dict[str, dict] = {}
+        charts: dict = {"tnb": None, "solar": None, "compare": None}
 
         async for event in runner.run_async(
             user_id="analyst", session_id=session_id, new_message=msg
@@ -354,36 +454,59 @@ async def run_true_mcp_turn(prompt: str, history: list) -> tuple[str, list[str],
                     if getattr(part, "function_call", None):
                         fc = part.function_call
                         tools_called.append(fc.name)
-                        if fc.name == "summarize_tnb_by_solar_period":
-                            tnb_tool_args = _function_call_args(getattr(fc, "args", None))
+                        tool_args[fc.name] = _function_call_args(getattr(fc, "args", None))
                     else:
-                        parsed = _payload_from_function_response(part)
-                        if parsed and parsed.get("stacked_bar_chart"):
-                            tnb_chart_payload = parsed
+                        parsed_pair = _payload_from_function_response(part)
+                        if parsed_pair:
+                            _store_chart_payload(charts, parsed_pair[0], parsed_pair[1])
                     if getattr(part, "text", None):
                         reply_parts.append(part.text)
 
-        if (
-            tnb_chart_payload is None
-            and "summarize_tnb_by_solar_period" in tools_called
-            and tnb_tool_args.get("from_date")
-            and tnb_tool_args.get("to_date")
-        ):
-            import mcp_db_server as srv
+        import mcp_db_server as srv
 
-            srv.DB_FILE = DB_FILE
-            raw = srv.summarize_tnb_by_solar_period(
-                tnb_tool_args["from_date"],
-                tnb_tool_args["to_date"],
-            )
-            parsed = json.loads(raw)
-            if parsed.get("status") == "success":
-                tnb_chart_payload = parsed
+        srv.DB_FILE = DB_FILE
+
+        if charts["tnb"] is None and "summarize_tnb_by_solar_period" in tools_called:
+            args = tool_args.get("summarize_tnb_by_solar_period", {})
+            if args.get("from_date") and args.get("to_date"):
+                parsed = json.loads(
+                    srv.summarize_tnb_by_solar_period(args["from_date"], args["to_date"])
+                )
+                if parsed.get("status") == "success":
+                    charts["tnb"] = parsed
+
+        if charts["solar"] is None and "summarize_solar_period" in tools_called:
+            args = tool_args.get("summarize_solar_period", {})
+            if args.get("data_period"):
+                parsed = json.loads(
+                    srv.summarize_solar_period(
+                        args["data_period"],
+                        args.get("from_date"),
+                        args.get("to_date"),
+                    )
+                )
+                if parsed.get("status") == "success":
+                    charts["solar"] = parsed
+
+        if charts["compare"] is None and "compare_solar_periods" in tools_called:
+            args = tool_args.get("compare_solar_periods", {})
+            if args.get("data_period_a") and args.get("data_period_b"):
+                parsed = json.loads(
+                    srv.compare_solar_periods(
+                        args["data_period_a"],
+                        args["data_period_b"],
+                        args.get("from_date"),
+                        args.get("to_date"),
+                    )
+                )
+                if parsed.get("status") == "success":
+                    charts["compare"] = parsed
 
         final_text = "".join(reply_parts) if reply_parts else "No response generated."
         mcp_stderr.seek(0)
         err_tail = mcp_stderr.read().strip()[-4000:]
-        return anonymize_text(final_text), tools_called, err_tail, tnb_chart_payload
+        bundle = {k: v for k, v in charts.items() if v is not None}
+        return anonymize_text(final_text), tools_called, err_tail, bundle
     finally:
         await mcp_toolset.close()
         mcp_stderr.close()
@@ -422,7 +545,7 @@ with st.sidebar:
         "What datasets and date ranges are currently loaded?",
         "Average daily TNB usage (kWh) by solar_period for the last week of August 2026.",
         "Summarize data_period 2026-10: production, import, export, and estimated savings.",
-        "Compare summarize_solar_period for 2026-10 vs 2026-11 (if November is loaded).",
+        "Compare solar production: data_period 2026-10 vs 2026-11 (load November first if needed).",
         "drop table solar_readings",
     ]
     for p in prompts:
@@ -454,9 +577,11 @@ for msg in st.session_state.messages:
             st.caption(
                 "🔌 **MCP calls:** " + " → ".join(f"`{t}`" for t in msg["tools_used"])
             )
-        st.markdown(msg["content"])
-        if msg.get("tnb_chart"):
+        if msg.get("charts"):
+            render_chart_bundle(msg["charts"])
+        elif msg.get("tnb_chart"):
             render_tnb_stacked_bar_chart(msg["tnb_chart"])
+        st.markdown(msg["content"])
 
 prompt_to_send = None
 if st.session_state.get("pending_prompt"):
@@ -477,7 +602,7 @@ if prompt_to_send:
     with st.chat_message("assistant"):
         with st.spinner("Preparing database and MCP server…"):
             ensure_solar_db_ready()
-            reply_text, tools_used, mcp_err, tnb_chart = asyncio.run(
+            reply_text, tools_used, mcp_err, charts = asyncio.run(
                 run_true_mcp_turn(prompt_to_send, st.session_state.messages[:-1])
             )
             if tools_used:
@@ -487,14 +612,13 @@ if prompt_to_send:
             if mcp_err:
                 with st.expander("⚠️ MCP server stderr (tool may have failed)", expanded=True):
                     st.code(mcp_err)
-            if tnb_chart:
-                render_tnb_stacked_bar_chart(tnb_chart)
+            render_chart_bundle(charts if charts else None)
             st.markdown(reply_text)
             st.session_state.messages.append(
                 {
                     "role": "assistant",
                     "content": reply_text,
                     "tools_used": tools_used,
-                    "tnb_chart": tnb_chart,
+                    "charts": charts,
                 }
             )
